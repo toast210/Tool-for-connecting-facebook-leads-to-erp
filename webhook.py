@@ -39,31 +39,65 @@ def verify_webhook():
 
 @app.route("/webhook/facebook-leads", methods=["POST"])
 def receive_lead():
-    """Meta POSTs here for leads from ANY subscribed Page."""
+    """Meta POSTs here for leads from ANY subscribed Page.
+
+    Every entry (page) and every change (lead) inside it is processed
+    independently, so one bad lead or one bad page can never block
+    any of the others in the same webhook delivery.
+    """
     payload = request.get_json(silent=True) or {}
 
-    try:
-        for entry in payload.get("entry", []):
-            page_id = entry.get("id")
-            page_config = PAGES.get(page_id)
+    entries = payload.get("entry", [])
+    processed = 0
+    failed = 0
 
-            if not page_config:
-                log.warning("Lead from unrecognized Page ID %s -- skipping. "
-                            "Add it to credentials.json if this Page is expected.", page_id)
+    for entry in entries:
+        page_id = entry.get("id")
+
+        try:
+            page_config = PAGES.get(page_id)
+        except Exception:
+            log.exception("Unexpected error looking up Page ID %s -- skipping entry.", page_id)
+            failed += 1
+            continue
+
+        if not page_config:
+            log.warning(
+                "Lead from unrecognized Page ID %s -- skipping. "
+                "Add it to credentials.json if this Page is expected.",
+                page_id,
+            )
+            failed += 1
+            continue
+
+        for change in entry.get("changes", []):
+            leadgen_id = change.get("value", {}).get("leadgen_id")
+            if not leadgen_id:
                 continue
 
-            for change in entry.get("changes", []):
-                leadgen_id = change.get("value", {}).get("leadgen_id")
-                if not leadgen_id:
-                    continue
-
+            # Each lead is isolated: a failure here never touches any
+            # other lead, whether from this page or another one in the
+            # same request.
+            try:
                 fields = fetch_lead_from_facebook(leadgen_id, page_config)
                 push_lead_to_erpnext(fields, page_config)
-    except Exception as e:
-        log.exception("Error processing lead webhook: %s", e)
-        # TODO: write failed payloads to a dead-letter file/table for retry
+                processed += 1
+            except Exception:
+                log.exception(
+                    "Failed to process lead %s (page=%s / %s) -- continuing with remaining leads.",
+                    leadgen_id,
+                    page_id,
+                    page_config.get("name"),
+                )
+                failed += 1
+                # TODO: write failed (leadgen_id, page_id) to a dead-letter
+                # file/table so it can be retried later instead of being
+                # dropped after this log line.
+                continue
 
-    return jsonify({"status": "received"}), 200
+    log.info("Webhook batch complete: %d processed, %d failed.", processed, failed)
+
+    return jsonify({"status": "received", "processed": processed, "failed": failed}), 200
 
 
 def fetch_lead_from_facebook(leadgen_id: str, page_config: dict) -> dict:
