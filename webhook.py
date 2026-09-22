@@ -90,9 +90,6 @@ def receive_lead():
                     page_config.get("name"),
                 )
                 failed += 1
-                # TODO: write failed (leadgen_id, page_id) to a dead-letter
-                # file/table so it can be retried later instead of being
-                # dropped after this log line.
                 continue
 
     log.info("Webhook batch complete: %d processed, %d failed.", processed, failed)
