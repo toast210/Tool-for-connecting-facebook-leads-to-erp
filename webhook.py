@@ -15,18 +15,20 @@ with open(CREDENTIALS_PATH, "r") as f:
     CREDS = json.load(f)
 
 VERIFY_TOKEN = CREDS["verify_token"]
-GRAPH_VERSION = CREDS.get("graph_api_version", "v19.0")
+GRAPH_VERSION = CREDS.get("graph_api_version", "v26.0")
 
 ERP_BASE_URL = CREDS["erpnext"]["base_url"]
 ERP_API_KEY = CREDS["erpnext"]["api_key"]
 ERP_API_SECRET = CREDS["erpnext"]["api_secret"]
 
-PAGES = CREDS["pages"]  # keyed by Facebook Page ID
+PAGES = CREDS["pages"]
+
+# Top-level fields to request from Graph API (not inside field_data)
+TOP_LEVEL_FIELDS = "field_data,campaign_name,adset_name,ad_name,platform,created_time"
 
 
 @app.route("/webhook/facebook-leads", methods=["GET"])
 def verify_webhook():
-    """Meta calls this once to verify the endpoint (shared across all Pages)."""
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
@@ -39,12 +41,6 @@ def verify_webhook():
 
 @app.route("/webhook/facebook-leads", methods=["POST"])
 def receive_lead():
-    """Meta POSTs here for leads from ANY subscribed Page.
-
-    Every entry (page) and every change (lead) inside it is processed
-    independently, so one bad lead or one bad page can never block
-    any of the others in the same webhook delivery.
-    """
     payload = request.get_json(silent=True) or {}
 
     entries = payload.get("entry", [])
@@ -54,17 +50,10 @@ def receive_lead():
     for entry in entries:
         page_id = entry.get("id")
 
-        try:
-            page_config = PAGES.get(page_id)
-        except Exception:
-            log.exception("Unexpected error looking up Page ID %s -- skipping entry.", page_id)
-            failed += 1
-            continue
-
+        page_config = PAGES.get(page_id)
         if not page_config:
             log.warning(
-                "Lead from unrecognized Page ID %s -- skipping. "
-                "Add it to credentials.json if this Page is expected.",
+                "Lead from unrecognized Page ID %s -- skipping.",
                 page_id,
             )
             failed += 1
@@ -75,16 +64,13 @@ def receive_lead():
             if not leadgen_id:
                 continue
 
-            # Each lead is isolated: a failure here never touches any
-            # other lead, whether from this page or another one in the
-            # same request.
             try:
                 fields = fetch_lead_from_facebook(leadgen_id, page_config)
                 push_lead_to_erpnext(fields, page_config)
                 processed += 1
             except Exception:
                 log.exception(
-                    "Failed to process lead %s (page=%s / %s) -- continuing with remaining leads.",
+                    "Failed to process lead %s (page=%s / %s) -- continuing.",
                     leadgen_id,
                     page_id,
                     page_config.get("name"),
@@ -93,38 +79,54 @@ def receive_lead():
                 continue
 
     log.info("Webhook batch complete: %d processed, %d failed.", processed, failed)
-
     return jsonify({"status": "received", "processed": processed, "failed": failed}), 200
 
 
 def fetch_lead_from_facebook(leadgen_id: str, page_config: dict) -> dict:
+    """Fetch lead from Graph API and return a flat dict of all fields."""
     url = f"https://graph.facebook.com/{GRAPH_VERSION}/{leadgen_id}"
     resp = requests.get(
         url,
-        params={"access_token": page_config["page_access_token"]},
-        timeout=10,
+        params={
+            "access_token": page_config["page_access_token"],
+            "fields": TOP_LEVEL_FIELDS,
+        },
+        timeout=15,
     )
     resp.raise_for_status()
     data = resp.json()
 
     fields = {}
+
+    # Extract field_data (form answers)
     for f in data.get("field_data", []):
         values = f.get("values") or [""]
         fields[f["name"]] = values[0]
+
+    # Merge top-level metadata (campaign, adset, ad, platform, created_time)
+    for key in ("campaign_name", "adset_name", "ad_name", "platform", "created_time"):
+        if data.get(key):
+            fields[key] = data[key]
+
     return fields
 
 
 def push_lead_to_erpnext(fields: dict, page_config: dict):
+    """Map Meta fields to ERPNext Lead doctype and create the record."""
     field_map = page_config.get("field_map", {})
     source = page_config.get("source", "Facebook Lead Ads")
 
-    payload = {"source": source}
+    payload = {"lead_source": source}
+
     for fb_field, erp_field in field_map.items():
         if fb_field in fields:
             payload[erp_field] = fields[fb_field]
 
+    # Fallback: ensure lead_name is always set
     payload.setdefault("lead_name", fields.get("full_name", "Facebook Lead"))
-    payload["notes"] = json.dumps(fields)
+
+    # Store raw data for debugging
+    payload["lead_raw_data"] = json.dumps(fields, ensure_ascii=False)
 
     resp = requests.post(
         f"{ERP_BASE_URL}/api/resource/Lead",
@@ -133,16 +135,25 @@ def push_lead_to_erpnext(fields: dict, page_config: dict):
             "Authorization": f"token {ERP_API_KEY}:{ERP_API_SECRET}",
             "Content-Type": "application/json",
         },
-        timeout=10,
+        timeout=15,
     )
 
     if resp.status_code >= 400:
-        log.error("ERPNext rejected lead (page=%s): %s", page_config.get("name"), resp.text)
+        log.error(
+            "ERPNext rejected lead (page=%s, status=%d): %s",
+            page_config.get("name"),
+            resp.status_code,
+            resp.text,
+        )
         resp.raise_for_status()
 
     created_name = resp.json()["data"]["name"]
-    log.info("Lead created in ERPNext: %s (page=%s, source=%s)",
-              created_name, page_config.get("name"), source)
+    log.info(
+        "Lead created in ERPNext: %s (page=%s, source=%s)",
+        created_name,
+        page_config.get("name"),
+        source,
+    )
 
 
 if __name__ == "__main__":
