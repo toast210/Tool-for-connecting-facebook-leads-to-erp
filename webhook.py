@@ -1,3 +1,9 @@
+"""Facebook Lead Ads -> ERPNext webhook.
+
+Receives Meta leadgen webhooks, queues the lead ID in SQLite, and a background
+worker fetches the full lead from the Graph API and POSTs it to ERPNext, with
+retries. See README.md for setup.
+"""
 import hashlib
 import hmac
 import json
@@ -5,936 +11,976 @@ import logging
 import os
 import random
 import re
+import socket
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import requests
 from flask import Flask, jsonify, request
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-log = logging.getLogger("fb-leads-erpnext")
-
-app = Flask(__name__)
-
-# --------------------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------------------
+# ---------------------------------------------------------------- constants
+MAX_RETRIES = 5                 # retries after the first attempt; failure #6 is final
+BACKOFF_BASE_SECONDS = 60       # 1, 2, 4, 8, 16 minutes
+BATCH_SIZE = 20                 # leads handled per worker loop
+HTTP_TIMEOUT = 15               # seconds
+STALE_PROCESSING_SECONDS = 300
+DONE_RETENTION_DAYS = 30
+DEAD_RETENTION_DAYS = 90
+WORKER_IDLE_SECONDS = 3
+MAINTENANCE_EVERY_SECONDS = 60
+HEARTBEAT_ALIVE_SECONDS = 30
 
 CREDENTIALS_PATH = os.environ.get("CREDENTIALS_PATH", "credentials.json")
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "leads.db")
+PORT = int(os.environ.get("PORT", "3000"))
 
-with open(CREDENTIALS_PATH, "r") as f:
-    CREDS = json.load(f)
+DEFAULT_GRAPH_FIELDS = (
+    "id,created_time,ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,"
+    "form_id,field_data,is_organic,platform,custom_disclaimer_responses"
+)
+AD_FIELDS = ["created_time", "ad_id", "ad_name", "adset_id", "adset_name",
+             "campaign_id", "campaign_name", "form_id", "platform", "is_organic"]
 
+# Output name -> form question keys (matched case-insensitively, ignoring spaces/punctuation).
+# Override or extend with "payload.field_mapping" in credentials.json.
+DEFAULT_FIELD_MAPPING = {
+    "Name": ["full_name", "name", "your_name", "customer_name"],
+    "Phone": ["phone_number", "phone", "mobile", "mobile_number", "work_phone_number", "whatsapp_number"],
+    "Email": ["email", "email_address", "work_email"],
+}
+# Graph/webhook field -> output name. Order matters: the first three are sent right after the answers.
+DEFAULT_META_NAMES = {
+    "ad_name": "Ad Name", "adset_name": "Adset Name", "campaign_name": "Campaign",
+    "ad_id": "Ad ID", "adset_id": "Adset ID", "campaign_id": "Campaign ID", "form_id": "Form ID",
+    "created_time": "Created Time", "platform": "Platform", "is_organic": "Is Organic",
+    "page_id": "Page ID", "lead_source": "Lead Source",
+}
+PRIMARY_META = ("ad_name", "adset_name", "campaign_name")
 
-def _require(key: str):
-    if key not in CREDS or not CREDS[key]:
-        raise RuntimeError(f"credentials.json is missing required key: {key}")
-    return CREDS[key]
+GRAPH_TOKEN_CODES = {10, 102, 190} | set(range(200, 300))
+GRAPH_TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 613} | set(range(80000, 80015))
 
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+                    format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
+log = logging.getLogger("fb-leads")
 
-VERIFY_TOKEN = _require("verify_token")
-APP_SECRET = _require("app_secret")
-ADMIN_API_KEY = _require("admin_api_key")
-GRAPH_VERSION = CREDS.get("graph_api_version", "v26.0")
-
-ERP_BASE_URL = CREDS["erpnext"]["base_url"].rstrip("/")
-ERP_API_KEY = CREDS["erpnext"]["api_key"]
-ERP_API_SECRET = CREDS["erpnext"]["api_secret"]
-# Name of the custom field on the ERPNext Lead doctype that stores the Facebook lead ID.
-ERP_ID_FIELD = CREDS["erpnext"].get("leadgen_id_field", "leadgen_id")
-# Ask ERPNext whether the lead already exists before inserting (prevents duplicates on retry).
-ERP_DUPLICATE_CHECK = CREDS["erpnext"].get("duplicate_check", True)
-
-PAGES = CREDS["pages"]
-
-# Optional: a webhook URL that receives {"text": "..."} when a lead dies (Slack/Mattermost style).
-ALERT_WEBHOOK_URL = CREDS.get("alert_webhook_url")
-
-# Fields requested from the Graph API Lead object. Everything returned (besides the special
-# handling of field_data / custom_disclaimer_responses) is copied into the payload as-is.
-# Ad-level fields (ad_*, adset_*, campaign_*) need the ads_management permission on the token.
-# Override with "graph_lead_fields" in credentials.json if your API version rejects a field.
-DEFAULT_GRAPH_FIELDS = [
-    "id", "created_time", "ad_id", "ad_name", "adset_id", "adset_name",
-    "campaign_id", "campaign_name", "form_id", "is_organic", "platform",
-    "partner_name", "custom_disclaimer_responses", "field_data",
-]
-_gf = CREDS.get("graph_lead_fields", DEFAULT_GRAPH_FIELDS)
-if isinstance(_gf, str):
-    _gf = [x.strip() for x in _gf.split(",") if x.strip()]
-GRAPH_LEAD_FIELDS = ",".join(_gf)
-# Keys of the Graph response that are handled specially (not copied verbatim).
-GRAPH_SPECIAL_KEYS = {"id", "field_data", "custom_disclaimer_responses"}
-
-# Retry policy: attempt 1 fails -> wait 1 min, then 2, 4, 8, 16 min; the 6th failure is final.
-MAX_RETRIES = 5
-MAX_ATTEMPTS = MAX_RETRIES + 1
-BACKOFF_BASE_SECONDS = 60
-BACKOFF_JITTER = 0.10  # +/-10% so leads that failed together do not retry in lockstep
-
-WORKER_POLL_SECONDS = 5
-BATCH_SIZE = 20  # max leads processed per loop, then a short pause (protects ERPNext after outages)
-STALE_PROCESSING_SECONDS = 300
-HTTP_TIMEOUT = 15
-
-ERROR_TEXT_LIMIT = 2000  # stored response bodies
-LAST_ERROR_LIMIT = 500  # short text kept on the lead row
-DONE_RETENTION_DAYS = 30
-DEAD_RETENTION_DAYS = 90  # Facebook stops returning leads after ~90 days anyway
-MAX_REQUEUES = int(CREDS.get("max_requeues", 5))
-
-# The exact payload sent to ERPNext is stored on the lead row (so retries skip the Graph fetch and
-# you can see what was sent). Set "clear_payload_on_done": true to erase it once the lead succeeds;
-# otherwise it is kept until the row is purged (DONE_RETENTION_DAYS / DEAD_RETENTION_DAYS).
-CLEAR_PAYLOAD_ON_DONE = bool(CREDS.get("clear_payload_on_done", False))
-
-# Worker threads (1 is enough for most setups; claiming is atomic so more is safe).
-WORKER_THREADS = max(1, min(8, int(CREDS.get("worker_threads", 1))))
-
-TRANSIENT = "transient"
-TOKEN = "token"
-PERMANENT = "permanent"
-
-# Graph API error codes
-GRAPH_TOKEN_CODES = {10, 102, 190}  # permission / session / OAuth problems (+ 200-299 below)
-GRAPH_TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 613}  # unknown, throttling, rate limits
-
-# Values that must never end up in logs or the database.
-SECRETS = [ERP_API_SECRET, f"{ERP_API_KEY}:{ERP_API_SECRET}", APP_SECRET, ADMIN_API_KEY]
-SECRETS += [p.get("page_access_token") for p in PAGES.values()]
-
-STOP = threading.Event()
-
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 1_000_000   # webhooks are tiny; reject anything large
 
 
-def utcnow() -> datetime:
+# ---------------------------------------------------------------- time utils
+_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def now_dt():
     return datetime.now(timezone.utc)
 
 
-def iso(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+def iso(dt):
+    return dt.strftime(_TS_FMT)
 
 
-def now_iso() -> str:
-    return iso(utcnow())
+def now_iso():
+    return iso(now_dt())
 
 
-def parse_iso(value):
-    """Parse an ISO 8601 string into our canonical UTC format. Returns None for empty input."""
-    if not value:
-        return None
+def parse_iso(s):
+    return datetime.strptime(s, _TS_FMT).replace(tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------- config
+_cfg_lock = threading.Lock()
+_cfg_cache = {"mtime": None, "data": None}
+
+
+def _load_config_file():
     try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        raise ValueError(f"Invalid datetime: {value!r} (use ISO 8601, e.g. 2026-10-05T08:00:00Z)")
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return iso(dt.astimezone(timezone.utc))
+        with open(CREDENTIALS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"Cannot read/parse {CREDENTIALS_PATH}: {e}")
+    if not isinstance(data, dict):
+        raise RuntimeError("credentials.json must contain a JSON object")
+    for key in ("verify_token", "app_secret", "admin_api_key"):
+        if not data.get(key):
+            raise RuntimeError(f"credentials.json: '{key}' is required")
+    erp = data.get("erpnext") or {}
+    if not (erp.get("lead_url") or erp.get("base_url")):
+        raise RuntimeError("credentials.json: erpnext.lead_url (or base_url) is required")
+    if not isinstance(data.get("pages"), dict) or not data["pages"]:
+        raise RuntimeError("credentials.json: 'pages' must contain at least one Page")
+    validate_payload_cfg(data.get("payload") or {})
+    return data
 
 
-def sanitize(text, limit=ERROR_TEXT_LIMIT):
-    """Strip tokens/secrets from text and truncate. Use before logging or storing any error."""
+def get_config():
+    """Load credentials.json, reloading automatically when the file changes.
+
+    If the file is edited into something invalid while the app is running, the last
+    good settings stay in use (and the error is logged) instead of breaking every request.
+    """
+    with _cfg_lock:
+        try:
+            mtime = os.path.getmtime(CREDENTIALS_PATH)
+        except OSError as e:
+            if _cfg_cache["data"] is not None:
+                return _cfg_cache["data"]
+            raise RuntimeError(f"Cannot read {CREDENTIALS_PATH}: {e}")
+        if mtime != _cfg_cache["mtime"] and mtime != _cfg_cache.get("bad_mtime"):
+            try:
+                _cfg_cache.update(mtime=mtime, data=_load_config_file(), bad_mtime=None)
+            except RuntimeError as e:
+                if _cfg_cache["data"] is None:
+                    raise
+                log.error("credentials.json changed but is invalid (%s); keeping the previous settings", e)
+                _cfg_cache["bad_mtime"] = mtime
+        return _cfg_cache["data"]
+
+
+def validate_payload_cfg(p):
+    def bad(msg):
+        raise RuntimeError(f"credentials.json payload: {msg}")
+    if not isinstance(p, dict):
+        bad("must be an object")
+    fm = p.get("field_mapping", {})
+    if not isinstance(fm, dict) or not all(
+            isinstance(k, str) and (isinstance(v, str) or (isinstance(v, list) and all(isinstance(x, str) for x in v)))
+            for k, v in fm.items()):
+        bad("field_mapping must map an output name to a form key or a list of form keys")
+    for key in ("drop_fields", "required_fields", "phone_fields", "email_fields", "send_meta_fields"):
+        if key in p and not (isinstance(p[key], list) and all(isinstance(x, str) for x in p[key])):
+            bad(f"{key} must be a list of strings")
+    for key in ("meta_field_names", "static_fields"):
+        if key in p and not isinstance(p[key], dict):
+            bad(f"{key} must be an object")
+    unknown = [k for k in p.get("send_meta_fields", []) if k not in DEFAULT_META_NAMES]
+    if unknown:
+        bad(f"send_meta_fields has unknown entries {unknown}; allowed: {list(DEFAULT_META_NAMES)}")
+    unknown = [k for k in p.get("meta_field_names", {}) if k not in DEFAULT_META_NAMES]
+    if unknown:
+        bad(f"meta_field_names has unknown keys {unknown}; allowed: {list(DEFAULT_META_NAMES)}")
+
+
+def erp_lead_url(cfg):
+    erp = cfg["erpnext"]
+    return erp.get("lead_url") or erp["base_url"].rstrip("/") + "/api/resource/Lead"
+
+
+def erp_headers(cfg):
+    erp = cfg["erpnext"]
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if erp.get("api_key") and erp.get("api_secret"):
+        headers["Authorization"] = f"token {erp['api_key']}:{erp['api_secret']}"
+    headers.update(erp.get("extra_headers") or {})
+    return headers
+
+
+# ---------------------------------------------------------------- redaction
+_REDACT_PATTERNS = [
+    (re.compile(r"(access_token=)[^&\s\"']+", re.I), r"\1[REDACTED]"),
+    (re.compile(r"(appsecret_proof=)[^&\s\"']+", re.I), r"\1[REDACTED]"),
+    (re.compile(r"(\"access_token\"\s*:\s*\")[^\"]+", re.I), r"\1[REDACTED]"),
+    (re.compile(r"((?:token|bearer)\s+)[A-Za-z0-9_\-.:]{8,}", re.I), r"\1[REDACTED]"),
+]
+
+
+def _known_secrets():
+    try:
+        cfg = get_config()
+    except Exception:
+        return []
+    vals = [cfg.get("app_secret"), cfg.get("admin_api_key"), cfg.get("verify_token")]
+    for p in cfg.get("pages", {}).values():
+        vals.append(p.get("page_access_token"))
+    erp = cfg.get("erpnext", {})
+    vals += [erp.get("api_key"), erp.get("api_secret")]
+    vals += list((erp.get("extra_headers") or {}).values())
+    return [v for v in vals if isinstance(v, str) and len(v) >= 6]
+
+
+def redact(text, limit=2000):
     if text is None:
         return None
     text = str(text)
-    text = re.sub(r"(access_token=)[^&\s'\"]+", r"\1REDACTED", text)
-    for secret in SECRETS:
-        if secret:
-            text = text.replace(secret, "REDACTED")
+    for secret in _known_secrets():
+        text = text.replace(secret, "[REDACTED]")
+    for pat, repl in _REDACT_PATTERNS:
+        text = pat.sub(repl, text)
     return text[:limit]
 
 
-# --------------------------------------------------------------------------------------
-# Database (SQLite, WAL mode, one connection per thread)
-# --------------------------------------------------------------------------------------
-
+# ---------------------------------------------------------------- database
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leads (
-    leadgen_id        TEXT PRIMARY KEY,
-    page_id           TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'pending'
-                      CHECK (status IN ('pending','processing','done','dead')),
-    attempts          INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at   TEXT NOT NULL,
-    last_error        TEXT,
-    last_error_stage  TEXT,
-    last_error_class  TEXT,
-    last_error_at     TEXT,
-    requeue_count     INTEGER NOT NULL DEFAULT 0,
-    created_at        TEXT NOT NULL,
-    updated_at        TEXT NOT NULL,
-    died_at           TEXT,
-    completed_at      TEXT,
-    payload           TEXT,                     -- JSON exactly as sent to ERPNext
-    webhook_value     TEXT                      -- JSON of the webhook's change.value (fallback data)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    leadgen_id TEXT NOT NULL UNIQUE,
+    page_id TEXT,
+    form_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    requeues INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    locked_at TEXT,
+    last_error TEXT,
+    last_error_class TEXT,
+    last_error_stage TEXT,
+    payload TEXT,
+    graph_data TEXT,
+    webhook_data TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    done_at TEXT,
+    dead_at TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_leads_due ON leads (status, next_attempt_at);
-
+CREATE INDEX IF NOT EXISTS idx_leads_queue ON leads(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_leads_page ON leads(page_id);
 CREATE TABLE IF NOT EXISTS lead_attempts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    leadgen_id      TEXT NOT NULL REFERENCES leads(leadgen_id) ON DELETE CASCADE,
-    attempt_no      INTEGER NOT NULL,
-    stage           TEXT NOT NULL,
-    classification  TEXT,
-    http_status     INTEGER,
-    exception_class TEXT,
-    response_body   TEXT,
-    duration_ms     INTEGER,
-    success         INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT NOT NULL
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    leadgen_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    ok INTEGER NOT NULL,
+    error_class TEXT,
+    http_status INTEGER,
+    response_body TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_attempts_lead ON lead_attempts (leadgen_id, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_attempts_lead ON lead_attempts(leadgen_id);
+CREATE TABLE IF NOT EXISTS workers (
+    worker_id TEXT PRIMARY KEY,
+    pid INTEGER,
+    last_seen TEXT NOT NULL
+);
 """
 
-_local = threading.local()
 
-
-def db() -> sqlite3.Connection:
-    conn = getattr(_local, "conn", None)
-    if conn is None:
-        # isolation_level=None -> autocommit; multi-statement work uses explicit BEGIN/COMMIT.
-        conn = sqlite3.connect(DATABASE_PATH, timeout=5, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        _local.conn = conn
+def db():
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
 def init_db():
-    conn = db()
-    conn.executescript(SCHEMA)
-    # Migration for databases created before the payload column existed.
-    columns = [r["name"] for r in conn.execute("PRAGMA table_info(leads)")]
-    for column in ("payload", "webhook_value"):
-        if column not in columns:
-            conn.execute(f"ALTER TABLE leads ADD COLUMN {column} TEXT")
-            log.info("Added '%s' column to leads table.", column)
-    log.info("Database ready at %s", DATABASE_PATH)
+    with closing(db()) as conn:
+        conn.executescript(SCHEMA)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(leads)")}
+        if "graph_data" not in cols:      # database created by an older version
+            conn.execute("ALTER TABLE leads ADD COLUMN graph_data TEXT")
 
 
-# --------------------------------------------------------------------------------------
-# Errors and HTTP helpers
-# --------------------------------------------------------------------------------------
+def record_attempt(conn, leadgen_id, attempt_no, stage, ok, error_class=None,
+                   http_status=None, body=None, error=None):
+    conn.execute(
+        "INSERT INTO lead_attempts(leadgen_id,attempt_no,stage,ok,error_class,http_status,"
+        "response_body,error,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (leadgen_id, attempt_no, stage, 1 if ok else 0, error_class, http_status,
+         redact(body), redact(error, 1000), now_iso()))
 
 
-class StageError(Exception):
-    """A failure in one stage ('fetch' = Graph API, 'push' = ERPNext)."""
-
-    def __init__(self, stage, classification, message, http_status=None,
-                 exc_class=None, body=None, duration_ms=None):
+# ---------------------------------------------------------------- errors
+class LeadError(Exception):
+    def __init__(self, stage, cls, message, http_status=None, body=None):
         super().__init__(message)
-        self.stage = stage
-        self.classification = classification
-        self.message = message
-        self.http_status = http_status
-        self.exc_class = exc_class
-        self.body = body
-        self.duration_ms = duration_ms
+        self.stage, self.cls = stage, cls
+        self.message, self.http_status, self.body = message, http_status, body
 
 
-def classify_graph(resp) -> str:
-    code = None
+def classify_graph(status, j):
+    err = j.get("error") if isinstance(j, dict) else None
+    code = err.get("code") if isinstance(err, dict) else None
+    msg = err.get("message") if isinstance(err, dict) else None
+    desc = f"Graph API error (HTTP {status}, code {code}): {msg}"
+    if isinstance(code, int):
+        if code in GRAPH_TOKEN_CODES:
+            return "token", desc
+        if code in GRAPH_TRANSIENT_CODES or err.get("is_transient"):
+            return "transient", desc
+    if status in (408, 429) or status >= 500:
+        return "transient", desc
+    return "permanent", desc
+
+
+def body_error(j):
+    """Detect an error hidden inside an HTTP 200 body (typical for Frappe)."""
+    if not isinstance(j, dict):
+        return None
+    bad = {"error", "failed", "fail", "failure"}
+    if j.get("exc") or j.get("exc_type") or j.get("exception"):
+        return str(j.get("exc_type") or j.get("exception") or j.get("exc"))[:300]
+    if j.get("error"):
+        return str(j["error"])[:300]
+    if str(j.get("status", "")).lower() in bad or j.get("success") is False:
+        return f"status={j.get('status')} message={j.get('message')}"[:300]
+    m = j.get("message")
+    if isinstance(m, dict) and (str(m.get("status", "")).lower() in bad
+                                or m.get("success") is False or m.get("error")):
+        return json.dumps(m)[:300]
+    return None
+
+
+TRANSIENT_BODY_RE = re.compile(
+    r"lock wait timeout|deadlock|timed out|timeout|temporarily unavailable|try again|TimestampMismatch", re.I)
+
+
+def server_messages(j):
+    """Readable text from Frappe's _server_messages (a JSON string of JSON strings)."""
+    raw = j.get("_server_messages") if isinstance(j, dict) else None
+    if not raw:
+        return ""
     try:
-        code = (resp.json().get("error") or {}).get("code")
-    except (ValueError, AttributeError):
-        pass
-    if code in GRAPH_TOKEN_CODES or (isinstance(code, int) and 200 <= code <= 299):
-        return TOKEN
-    if resp.status_code == 429 or resp.status_code >= 500 or code in GRAPH_TRANSIENT_CODES:
-        return TRANSIENT
-    return PERMANENT
+        items = json.loads(raw) if isinstance(raw, str) else raw
+        out = []
+        for it in items:
+            try:
+                it = json.loads(it) if isinstance(it, str) else it
+            except ValueError:
+                pass
+            out.append(str(it.get("message") if isinstance(it, dict) else it))
+        return " | ".join(out)
+    except (ValueError, TypeError):
+        return str(raw)
 
 
-def classify_erp(resp) -> str:
-    status = resp.status_code
-    if status >= 500 or status in (408, 429):
-        return TRANSIENT
+def erp_created_name(text):
+    try:
+        j = json.loads(text)
+    except (ValueError, TypeError):
+        return "n/a"
+    if isinstance(j, dict):
+        for src in (j, j.get("message"), j.get("data")):
+            if isinstance(src, dict) and src.get("name"):
+                return str(src["name"])
+        if isinstance(j.get("message"), str):
+            return j["message"][:60]
+    return "n/a"
+
+
+def is_duplicate(status, text, j, id_field):
+    if status == 409:
+        return True
+    low = (text or "").lower()
+    if isinstance(j, dict) and str(j.get("exc_type", "")).lower().startswith("duplicate"):
+        return True
+    return "duplicate" in low and id_field.lower() in low
+
+
+def classify_erp_http(status):
     if status in (401, 403):
-        return TOKEN  # ERPNext API credentials/permissions: affects every lead, fix then requeue
-    return PERMANENT  # e.g. 417 validation / mandatory field errors
+        return "token"
+    if status in (408, 429) or status >= 500:
+        return "transient"
+    return "permanent"
 
 
-def http_call(stage, method, url, classify, **kwargs):
-    """Make one HTTP call. Returns (response, duration_ms) or raises StageError."""
-    start = time.monotonic()
+# ---------------------------------------------------------------- graph fetch
+def fetch_lead(row, cfg):
+    page = cfg["pages"].get(str(row["page_id"]))
+    if not page or not page.get("page_access_token"):
+        raise LeadError("fetch", "permanent", f"No page_access_token configured for page {row['page_id']}")
+    fields = cfg.get("graph_lead_fields") or DEFAULT_GRAPH_FIELDS
+    if isinstance(fields, list):
+        fields = ",".join(fields)
+    base = cfg.get("graph_base_url", "https://graph.facebook.com").rstrip("/")
+    url = f"{base}/{cfg.get('graph_api_version', 'v26.0')}/{row['leadgen_id']}"
     try:
-        resp = requests.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+        token = page["page_access_token"]
+        proof = hmac.new(cfg["app_secret"].encode(), token.encode(), hashlib.sha256).hexdigest()
+        r = requests.get(url, params={"fields": fields, "access_token": token, "appsecret_proof": proof},
+                         timeout=HTTP_TIMEOUT)
     except requests.RequestException as e:
-        raise StageError(
-            stage, TRANSIENT, f"{type(e).__name__}: {e}",
-            exc_class=type(e).__name__,
-            duration_ms=int((time.monotonic() - start) * 1000),
-        )
-    ms = int((time.monotonic() - start) * 1000)
-    if resp.status_code >= 400:
-        raise StageError(
-            stage, classify(resp), f"HTTP {resp.status_code}",
-            http_status=resp.status_code, exc_class="HTTPError",
-            body=resp.text, duration_ms=ms,
-        )
-    return resp, ms
-
-
-def json_or_error(stage, resp):
+        raise LeadError("fetch", "transient", f"Graph request failed: {e}")
     try:
-        return resp.json()
+        j = r.json()
     except ValueError:
-        raise StageError(stage, TRANSIENT, "Response was not valid JSON",
-                         http_status=resp.status_code, exc_class="JSONDecodeError", body=resp.text)
+        j = None
+    if r.status_code >= 400 or (isinstance(j, dict) and "error" in j):
+        cls, desc = classify_graph(r.status_code, j)
+        raise LeadError("fetch", cls, desc, r.status_code, r.text)
+    if not isinstance(j, dict):
+        raise LeadError("fetch", "transient", "Graph returned a non-JSON body", r.status_code, r.text)
+    return j
 
 
-# --------------------------------------------------------------------------------------
-# Facebook + ERPNext calls
-# --------------------------------------------------------------------------------------
+def norm_key(s):
+    return re.sub(r"[^a-z0-9]+", "_", str(s).lower()).strip("_")
 
 
-def fetch_lead_from_facebook(leadgen_id: str, page_config: dict) -> dict:
-    """Fetch the lead from the Graph API and return a flat dict of every field it gives us:
-    all form answers plus ad/campaign/form metadata and the creation time."""
-    resp, _ = http_call(
-        "fetch", "GET", f"https://graph.facebook.com/{GRAPH_VERSION}/{leadgen_id}", classify_graph,
-        params={"access_token": page_config["page_access_token"], "fields": GRAPH_LEAD_FIELDS},
-    )
-    data = json_or_error("fetch", resp)
-
-    fields = {}
-
-    # Form answers. A question can have several values (multi-select): keep them all.
-    for f in data.get("field_data") or []:
-        values = [str(v) for v in (f.get("values") or [])]
-        fields[f["name"]] = ", ".join(values)
-
-    # Answers to optional disclaimer checkboxes (not included in field_data).
-    disclaimers = data.get("custom_disclaimer_responses") or []
-    if disclaimers:
-        if all(isinstance(d, dict) and d.get("checkbox_key") and "is_checked" in d for d in disclaimers):
-            for d in disclaimers:
-                fields[f"disclaimer_{d['checkbox_key']}"] = d["is_checked"]
-        else:
-            fields["custom_disclaimer_responses"] = json.dumps(disclaimers, ensure_ascii=False)
-
-    # Everything else the Graph API returned (campaign_name, adset_name, ad_name, ad_id, form_id,
-    # created_time, platform, is_organic, ...). Nested values are stored as JSON text.
-    for key, value in data.items():
-        if key in GRAPH_SPECIAL_KEYS or value is None:
-            continue
-        fields[key] = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
-
-    return fields
+def pretty_name(key):
+    words = re.sub(r"[_\s]+", " ", str(key)).strip().split()
+    return " ".join(w[:1].upper() + w[1:] for w in words) or str(key)
 
 
-def erp_headers() -> dict:
+def clean_phone(v):
+    v = v.strip()
+    if v.lower().startswith("p:"):            # Meta sometimes prefixes numbers with "p:"
+        v = v[2:]
+    cleaned = re.sub(r"[^\d+]", "", v)
+    return cleaned if re.search(r"\d", cleaned) else v
+
+
+def payload_settings(cfg):
+    p = cfg.get("payload") or {}
+    mapping = {k: list(v) for k, v in DEFAULT_FIELD_MAPPING.items()}
+    for out_name, src in (p.get("field_mapping") or {}).items():
+        mapping[out_name] = [src] if isinstance(src, str) else list(src)
+    names = dict(DEFAULT_META_NAMES)
+    names.update(p.get("meta_field_names") or {})
     return {
-        "Authorization": f"token {ERP_API_KEY}:{ERP_API_SECRET}",
-        "Content-Type": "application/json",
+        "mapping": mapping,
+        "meta_names": names,
+        "send_meta": p.get("send_meta_fields", list(DEFAULT_META_NAMES)),
+        "include_unmapped": p.get("include_unmapped_answers", True),
+        "drop": {norm_key(k) for k in p.get("drop_fields", [])},
+        "required": p.get("required_fields", []),
+        "phone_fields": set(p.get("phone_fields", ["Phone"])),
+        "email_fields": set(p.get("email_fields", ["Email"])),
+        "normalize": p.get("normalize_values", True),
+        "static": p.get("static_fields") or {},
     }
 
 
-def erp_find_existing(leadgen_id: str):
-    """Return the name of an existing ERPNext Lead with this leadgen_id, or None."""
-    params = {
-        "filters": json.dumps([[ERP_ID_FIELD, "=", leadgen_id]]),
-        "fields": json.dumps(["name"]),
-        "limit_page_length": 1,
-    }
-    resp, _ = http_call(
-        "push", "GET", f"{ERP_BASE_URL}/api/resource/Lead", classify_erp,
-        params=params, headers=erp_headers(),
-    )
-    data = json_or_error("push", resp).get("data") or []
-    return data[0]["name"] if data else None
+def build_payload(row, graph, cfg):
+    """Turn a Graph lead into the flat JSON sent to ERPNext (field matching happens here)."""
+    ps = payload_settings(cfg)
+    wh = json.loads(row["webhook_data"] or "{}")
+    page = cfg["pages"].get(str(row["page_id"]), {})
+    id_field = cfg["erpnext"].get("leadgen_id_field", "leadgen_id")
+
+    answers = {}        # normalised key -> (original key, value)
+    for f in graph.get("field_data") or []:
+        name = f.get("name")
+        if name:
+            answers[norm_key(name)] = (name, ", ".join(str(v) for v in (f.get("values") or [])).strip())
+
+    used, out = set(), {}
+    for out_name, sources in ps["mapping"].items():
+        val = ""
+        for src in sources:
+            k = norm_key(src)
+            if k in answers:
+                used.add(k)
+                if not val:
+                    val = answers[k][1]
+        out[out_name] = val
+    if "Name" in out and not out["Name"]:       # build a name from first/last name when there is no full name
+        first = answers.get("first_name", ("", ""))[1]
+        last = answers.get("last_name", ("", ""))[1]
+        if first or last:
+            out["Name"] = f"{first} {last}".strip()
+            used.update(k for k in ("first_name", "last_name") if k in answers)
+
+    if ps["normalize"]:
+        for k, v in out.items():
+            if k in ps["phone_fields"] and v:
+                out[k] = clean_phone(v)
+            elif k in ps["email_fields"] and v:
+                out[k] = v.strip().lower()
+            elif k == "Name" and v:
+                out[k] = " ".join(v.split())
+
+    # ad / page data
+    vals = {k: graph.get(k) for k in AD_FIELDS}
+    for k, fb in (("ad_id", wh.get("ad_id")), ("adset_id", wh.get("adgroup_id")),
+                  ("form_id", wh.get("form_id")), ("created_time", wh.get("created_time"))):
+        if vals.get(k) is None:
+            vals[k] = fb
+    vals["page_id"] = str(row["page_id"])
+    vals["lead_source"] = page.get("source", "Facebook Lead Ads")
+    meta = {}
+    for k in ps["send_meta"]:
+        v = vals.get(k)
+        meta[k] = ("" if v is None else v)
+
+    def put_meta(keys):
+        for k in keys:
+            if k in meta:
+                out[ps["meta_names"][k]] = meta[k]
+    put_meta(PRIMARY_META)
+
+    reserved = set(out) | {ps["meta_names"][k] for k in meta} | {id_field}
+    if ps["include_unmapped"]:
+        for nk, (orig, val) in answers.items():
+            if nk in used or nk in ps["drop"] or not val:
+                continue
+            name = pretty_name(orig)
+            if name in reserved:
+                name += " (form)"
+            out[name] = val
+            reserved.add(name)
+    for d in graph.get("custom_disclaimer_responses") or []:
+        key = d.get("checkbox_key")
+        if key:
+            out[f"Disclaimer {pretty_name(key)}"] = d.get("status", d.get("value", ""))
+
+    put_meta([k for k in meta if k not in PRIMARY_META])
+    out.update(ps["static"])
+    out[id_field] = row["leadgen_id"]
+    return out
 
 
-def build_payload(leadgen_id: str, fields: dict, page_config: dict, page_id: str,
-                  webhook_value: dict = None) -> dict:
-    """The exact JSON sent to ERPNext: every Facebook field as-is, plus lead_source, page_id and
-    the lead ID. Values the webhook itself carried (ad_id, form_id, created_time) are used only
-    as a fallback when the Graph API did not return them (e.g. missing ads_management)."""
-    payload = dict(fields)
-
-    wv = webhook_value or {}
-    created = wv.get("created_time")
-    if isinstance(created, (int, float)):
-        created = datetime.fromtimestamp(created, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")
-    fallback = {
-        "ad_id": wv.get("ad_id") or wv.get("adgroup_id"),
-        "form_id": wv.get("form_id"),
-        "created_time": created,
-    }
-    for key, value in fallback.items():
-        if value not in (None, "") and key not in payload:
-            payload[key] = value
-
-    payload["page_id"] = page_id
-    payload["lead_source"] = page_config.get("source", "Facebook Lead Ads")
-    payload[ERP_ID_FIELD] = leadgen_id
-    return payload
-
-
-def push_lead_to_erpnext(payload: dict):
-    """Send the payload to ERPNext as-is (mapping is done on the ERPNext side).
-
-    Returns (created_name, already_existed).
-    """
+# ---------------------------------------------------------------- ERPNext push
+def _erp_request(method, url, cfg, **kw):
     try:
-        resp, _ = http_call(
-            "push", "POST", f"{ERP_BASE_URL}/api/resource/Lead", classify_erp,
-            json=payload, headers=erp_headers(),
-        )
-    except StageError as e:
-        # A unique-constraint rejection on our own ID field means an earlier attempt succeeded.
-        if e.http_status == 409 and ERP_ID_FIELD in (e.body or ""):
-            return None, True
-        raise
-    return json_or_error("push", resp)["data"]["name"], False
+        return requests.request(method, url, headers=erp_headers(cfg), timeout=HTTP_TIMEOUT, **kw)
+    except requests.RequestException as e:
+        raise LeadError("push", "transient", f"ERPNext request failed: {e}")
 
 
-# --------------------------------------------------------------------------------------
-# Queue operations
-# --------------------------------------------------------------------------------------
+def erp_already_exists(leadgen_id, cfg):
+    erp = cfg["erpnext"]
+    field = erp.get("leadgen_id_field", "leadgen_id")
+    url = erp.get("duplicate_check_url") or erp_lead_url(cfg)
+    r = _erp_request("GET", url, cfg, params={
+        "filters": json.dumps([[field, "=", leadgen_id]]),
+        "fields": json.dumps(["name"]), "limit_page_length": 1})
+    if r.status_code >= 400:
+        raise LeadError("push", classify_erp_http(r.status_code),
+                        f"Duplicate check failed (HTTP {r.status_code})", r.status_code, r.text)
+    try:
+        j = r.json()
+    except ValueError:
+        return False
+    data = j.get("data", j.get("message")) if isinstance(j, dict) else None
+    return bool(data) and isinstance(data, list)
 
 
-def enqueue_lead(leadgen_id: str, page_id: str, webhook_value: dict = None) -> bool:
-    """Insert a lead into the queue. Returns True if new, False if it was already queued."""
-    now = now_iso()
-    cur = db().execute(
-        "INSERT OR IGNORE INTO leads (leadgen_id, page_id, status, attempts, next_attempt_at,"
-        " created_at, updated_at, webhook_value) VALUES (?, ?, 'pending', 0, ?, ?, ?, ?)",
-        (leadgen_id, page_id, now, now, now,
-         json.dumps(webhook_value, ensure_ascii=False) if webhook_value else None),
-    )
-    return cur.rowcount == 1
+def push_lead(leadgen_id, payload, cfg):
+    """POST the lead to ERPNext. Returns (http_status, body_text). Raises LeadError."""
+    erp = cfg["erpnext"]
+    id_field = erp.get("leadgen_id_field", "leadgen_id")
+    if erp.get("duplicate_check") and erp_already_exists(leadgen_id, cfg):
+        return 200, "duplicate_check: already exists"
+    r = _erp_request("POST", erp_lead_url(cfg), cfg, json=payload)
+    text = r.text
+    try:
+        j = r.json()
+    except ValueError:
+        j = None
+    if is_duplicate(r.status_code, text, j, id_field):
+        return r.status_code, text            # already created -> treat as success
+    if r.status_code >= 400:
+        raise LeadError("push", classify_erp_http(r.status_code),
+                        f"ERPNext HTTP {r.status_code}: {redact(text, 300)}", r.status_code, text)
+    err = body_error(j)
+    if err:
+        sm = server_messages(j)
+        detail = f"{err}; {sm}" if sm else err
+        cls = "transient" if TRANSIENT_BODY_RE.search(detail) else "permanent"
+        raise LeadError("push", cls, f"ERPNext rejected the lead (HTTP {r.status_code}): {detail}"[:1000],
+                        r.status_code, text)
+    return r.status_code, text
 
 
-def claim_one():
-    """Atomically claim the oldest due lead (pending -> processing, attempts + 1)."""
-    conn = db()
-    now = now_iso()
+# ---------------------------------------------------------------- queue processing
+def claim_one(conn):
     conn.execute("BEGIN IMMEDIATE")
     try:
+        now = now_iso()
         row = conn.execute(
-            "SELECT leadgen_id FROM leads WHERE status='pending' AND next_attempt_at <= ?"
-            " ORDER BY next_attempt_at LIMIT 1",
-            (now,),
-        ).fetchone()
-        if row is None:
-            conn.execute("COMMIT")
-            return None
-        conn.execute(
-            "UPDATE leads SET status='processing', attempts=attempts+1, updated_at=?"
-            " WHERE leadgen_id=?",
-            (now, row["leadgen_id"]),
-        )
-        lead = conn.execute(
-            "SELECT * FROM leads WHERE leadgen_id=?", (row["leadgen_id"],)
-        ).fetchone()
+            "SELECT * FROM leads WHERE status='pending' AND next_attempt_at<=? "
+            "ORDER BY next_attempt_at LIMIT 1", (now,)).fetchone()
+        if row:
+            conn.execute("UPDATE leads SET status='processing', locked_at=?, updated_at=? WHERE id=?",
+                         (now, now, row["id"]))
         conn.execute("COMMIT")
-        return lead
+        return row
     except Exception:
         conn.execute("ROLLBACK")
         raise
 
 
-def reset_stale_processing():
-    """Recover leads left in 'processing' by a crash."""
-    cutoff = iso(utcnow() - timedelta(seconds=STALE_PROCESSING_SECONDS))
-    cur = db().execute(
-        "UPDATE leads SET status='pending', updated_at=? WHERE status='processing' AND updated_at < ?",
-        (now_iso(), cutoff),
-    )
-    if cur.rowcount:
-        log.warning("Reset %d stale 'processing' lead(s) to pending.", cur.rowcount)
+def backoff_seconds(failures):
+    base = BACKOFF_BASE_SECONDS * (2 ** (failures - 1))
+    return base * random.uniform(0.9, 1.1)
 
 
-def purge_old():
-    done_cutoff = iso(utcnow() - timedelta(days=DONE_RETENTION_DAYS))
-    dead_cutoff = iso(utcnow() - timedelta(days=DEAD_RETENTION_DAYS))
-    cur = db().execute(
-        "DELETE FROM leads WHERE (status='done' AND completed_at < ?)"
-        " OR (status='dead' AND died_at < ?)",
-        (done_cutoff, dead_cutoff),
-    )
-    if cur.rowcount:
-        log.info("Purged %d old lead(s).", cur.rowcount)
-
-
-def record_attempt(leadgen_id, attempt_no, stage, success, classification=None, http_status=None,
-                   exc_class=None, body=None, duration_ms=None):
-    db().execute(
-        "INSERT INTO lead_attempts (leadgen_id, attempt_no, stage, classification, http_status,"
-        " exception_class, response_body, duration_ms, success, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (leadgen_id, attempt_no, stage, classification, http_status, exc_class,
-         sanitize(body), duration_ms, 1 if success else 0, now_iso()),
-    )
-
-
-def mark_done(leadgen_id: str):
-    now = now_iso()
-    clear = ", payload=NULL" if CLEAR_PAYLOAD_ON_DONE else ""
-    db().execute(
-        f"UPDATE leads SET status='done', completed_at=?, updated_at=?{clear} WHERE leadgen_id=?",
-        (now, now, leadgen_id),
-    )
-
-
-def notify_dead(leadgen_id: str, page_id: str, err: StageError):
-    page_name = PAGES.get(page_id, {}).get("name", page_id)
-    msg = (f"Lead {leadgen_id} (page {page_name}) is DEAD. "
-           f"Stage={err.stage} class={err.classification} error={sanitize(err.message, 300)}")
-    log.error(msg)
-    if not ALERT_WEBHOOK_URL:
-        return
+def post_alert(cfg, text):
+    """POST {"text": ...} to alert_webhook_url (Slack/Mattermost style). Returns (ok, error)."""
+    url = cfg.get("alert_webhook_url")
+    if not url:
+        return False, "alert_webhook_url is not configured"
     try:
-        requests.post(ALERT_WEBHOOK_URL, json={"text": msg}, timeout=10)
-    except Exception:
-        log.exception("Could not send dead-lead alert.")
+        r = requests.post(url, json={"text": text}, timeout=5)
+        if r.status_code >= 300:
+            return False, f"alert webhook answered HTTP {r.status_code}"
+        return True, None
+    except requests.RequestException as e:
+        return False, redact(e, 300)
 
 
-def handle_failure(lead, err: StageError):
-    leadgen_id = lead["leadgen_id"]
-    attempts = lead["attempts"]
-    now = utcnow()
-
-    record_attempt(
-        leadgen_id, attempts, err.stage, False, classification=err.classification,
-        http_status=err.http_status, exc_class=err.exc_class,
-        body=err.body if err.body else err.message, duration_ms=err.duration_ms,
-    )
-
-    short_error = sanitize(
-        f"{err.message}: {err.body}" if err.body else err.message, LAST_ERROR_LIMIT
-    )
-
-    dead = err.classification == PERMANENT or attempts >= MAX_ATTEMPTS
-    if dead:
-        db().execute(
-            "UPDATE leads SET status='dead', died_at=?, last_error=?, last_error_stage=?,"
-            " last_error_class=?, last_error_at=?, updated_at=? WHERE leadgen_id=?",
-            (iso(now), short_error, err.stage, err.classification, iso(now), iso(now), leadgen_id),
-        )
-        notify_dead(leadgen_id, lead["page_id"], err)
+def send_alert(cfg, row, err):
+    if not cfg.get("alert_webhook_url"):
         return
-
-    delay = BACKOFF_BASE_SECONDS * (2 ** (attempts - 1))
-    delay *= 1 + random.uniform(-BACKOFF_JITTER, BACKOFF_JITTER)
-    next_at = now + timedelta(seconds=delay)
-    db().execute(
-        "UPDATE leads SET status='pending', next_attempt_at=?, last_error=?, last_error_stage=?,"
-        " last_error_class=?, last_error_at=?, updated_at=? WHERE leadgen_id=?",
-        (iso(next_at), short_error, err.stage, err.classification, iso(now), iso(now), leadgen_id),
-    )
-    log.warning(
-        "Lead %s failed (attempt %d/%d, stage=%s, class=%s). Retrying in %ds.",
-        leadgen_id, attempts, MAX_ATTEMPTS, err.stage, err.classification, int(delay),
-    )
+    text = (f":rotating_light: Lead {row['leadgen_id']} (page {row['page_id']}) is DEAD at stage "
+            f"'{err.stage}' [{err.cls}]: {redact(err.message, 300)}")
+    ok, why = post_alert(cfg, text)
+    if not ok:
+        log.warning("alert failed: %s", why)
 
 
-def process_lead(lead):
-    leadgen_id = lead["leadgen_id"]
-    attempt_no = lead["attempts"]
-    page_config = PAGES.get(lead["page_id"])
-    started = time.monotonic()
+def process_lead(row):
+    cfg = get_config()
+    lid = row["leadgen_id"]
+    attempt_no = row["attempts"] + 1
     stage = "fetch"
-
     try:
-        if page_config is None:
-            raise StageError("fetch", PERMANENT, f"Page ID {lead['page_id']} not in configuration")
+        with closing(db()) as conn:
+            if row["graph_data"]:
+                graph = json.loads(row["graph_data"])
+            elif row["payload"]:          # lead queued by an older version: resend as stored
+                graph = None
+            else:
+                graph = fetch_lead(row, cfg)
+                conn.execute("UPDATE leads SET graph_data=? WHERE id=?", (json.dumps(graph), row["id"]))
+            stage = "map"
+            if graph is not None:
+                # rebuilt on every attempt, so a fixed mapping applies on requeue without refetching
+                payload = build_payload(row, graph, cfg)
+            else:
+                payload = json.loads(row["payload"])
+            missing = [f for f in (cfg.get("payload") or {}).get("required_fields", [])
+                       if not str(payload.get(f, "")).strip()]
+            if missing:
+                raise LeadError("map", "permanent", f"Required field(s) empty after mapping: {', '.join(missing)}")
+            conn.execute("UPDATE leads SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
+            stage = "push"
+            status, body = push_lead(lid, payload, cfg)
+            now = now_iso()
+            record_attempt(conn, lid, attempt_no, "push", True, http_status=status, body=body)
+            clear = 1 if cfg.get("clear_payload_on_done") else 0
+            conn.execute(
+                "UPDATE leads SET status='done', attempts=?, done_at=?, updated_at=?, locked_at=NULL, "
+                "last_error=NULL, last_error_class=NULL, last_error_stage=NULL, "
+                "payload=CASE WHEN ? THEN NULL ELSE payload END, "
+                "graph_data=CASE WHEN ? THEN NULL ELSE graph_data END WHERE id=?",
+                (attempt_no, now, now, clear, clear, row["id"]))
+        log.info("Lead %s done (created in ERPNext: %s, page=%s)", lid, erp_created_name(body),
+                 cfg["pages"].get(str(row["page_id"]), {}).get("name", row["page_id"]))
+    except LeadError as e:
+        handle_failure(row, cfg, attempt_no, e)
+    except Exception as e:  # unexpected: treat as transient, bounded by the retry limit
+        log.exception("unexpected error on lead %s", lid)
+        handle_failure(row, cfg, attempt_no, LeadError(stage, "transient", f"Unexpected error: {e!r}"))
 
-        payload = None
-        if lead["payload"]:
-            try:
-                payload = json.loads(lead["payload"])  # stored on an earlier attempt: skip Graph
-            except ValueError:
-                log.warning("Stored payload for %s is unreadable; refetching.", leadgen_id)
-        if payload is None:
-            fields = fetch_lead_from_facebook(leadgen_id, page_config)
-            try:
-                webhook_value = json.loads(lead["webhook_value"]) if lead["webhook_value"] else None
-            except ValueError:
-                webhook_value = None
-            payload = build_payload(leadgen_id, fields, page_config, lead["page_id"], webhook_value)
-            db().execute(
-                "UPDATE leads SET payload=?, updated_at=? WHERE leadgen_id=?",
-                (json.dumps(payload, ensure_ascii=False), now_iso(), leadgen_id),
-            )
 
-        stage = "push"
-        existing = erp_find_existing(leadgen_id) if ERP_DUPLICATE_CHECK else None
-        if existing:
-            created, note = existing, "already existed in ERPNext"
+def handle_failure(row, cfg, attempt_no, err):
+    final = err.cls == "permanent" or attempt_no > MAX_RETRIES
+    now = now_dt()
+    with closing(db()) as conn:
+        record_attempt(conn, row["leadgen_id"], attempt_no, err.stage, False, err.cls,
+                       err.http_status, err.body, err.message)
+        common = (attempt_no, redact(err.message, 1000), err.cls, err.stage, iso(now))
+        if final:
+            conn.execute(
+                "UPDATE leads SET status='dead', attempts=?, last_error=?, last_error_class=?, "
+                "last_error_stage=?, updated_at=?, dead_at=?, locked_at=NULL WHERE id=?",
+                common + (iso(now), row["id"]))
+            log.error("lead %s DEAD (%s/%s): %s", row["leadgen_id"], err.stage, err.cls, redact(err.message, 300))
         else:
-            created, already = push_lead_to_erpnext(payload)
-            note = "already existed in ERPNext" if already else "created in ERPNext"
-            created = created or "(existing)"
-
-    except StageError as err:
-        handle_failure(lead, err)
-        return
-    except Exception as e:  # a bug or something unexpected: treat as transient, keep the lead safe
-        log.exception("Unexpected error while processing lead %s", leadgen_id)
-        handle_failure(lead, StageError(stage, TRANSIENT, f"Unexpected {type(e).__name__}: {e}",
-                                        exc_class=type(e).__name__))
-        return
-
-    record_attempt(
-        leadgen_id, attempt_no, "push", True, body=f"{note}: {created}",
-        duration_ms=int((time.monotonic() - started) * 1000),
-    )
-    mark_done(leadgen_id)
-    log.info("Lead %s done (%s: %s, page=%s).", leadgen_id, note, created,
-             page_config.get("name"))
+            delay = backoff_seconds(attempt_no)
+            conn.execute(
+                "UPDATE leads SET status='pending', attempts=?, last_error=?, last_error_class=?, "
+                "last_error_stage=?, updated_at=?, next_attempt_at=?, locked_at=NULL WHERE id=?",
+                common + (iso(now + timedelta(seconds=delay)), row["id"]))
+            log.warning("lead %s failed (%s/%s), retry in %ds: %s", row["leadgen_id"], err.stage,
+                        err.cls, delay, redact(err.message, 300))
+    if final:
+        send_alert(cfg, row, err)
 
 
-# --------------------------------------------------------------------------------------
-# Worker thread
-# --------------------------------------------------------------------------------------
+def heartbeat(worker_id):
+    with closing(db()) as conn:
+        conn.execute("INSERT INTO workers(worker_id,pid,last_seen) VALUES(?,?,?) "
+                     "ON CONFLICT(worker_id) DO UPDATE SET last_seen=excluded.last_seen",
+                     (worker_id, os.getpid(), now_iso()))
 
 
-def worker_loop():
-    log.info("Worker thread started.")
-    last_purge = 0.0
-    while not STOP.is_set():
-        wait = WORKER_POLL_SECONDS
+def maintenance():
+    now = now_dt()
+    with closing(db()) as conn:
+        stale = iso(now - timedelta(seconds=STALE_PROCESSING_SECONDS))
+        n = conn.execute("UPDATE leads SET status='pending', locked_at=NULL, updated_at=? "
+                         "WHERE status='processing' AND locked_at<?", (iso(now), stale)).rowcount
+        if n:
+            log.warning("reset %d stale processing lead(s)", n)
+        done_cut = iso(now - timedelta(days=DONE_RETENTION_DAYS))
+        dead_cut = iso(now - timedelta(days=DEAD_RETENTION_DAYS))
+        old = ("SELECT leadgen_id FROM leads WHERE (status='done' AND done_at<?) "
+               "OR (status='dead' AND dead_at<?)")
+        conn.execute(f"DELETE FROM lead_attempts WHERE leadgen_id IN ({old})", (done_cut, dead_cut))
+        conn.execute("DELETE FROM leads WHERE (status='done' AND done_at<?) OR (status='dead' AND dead_at<?)",
+                     (done_cut, dead_cut))
+        conn.execute("DELETE FROM workers WHERE last_seen<?", (iso(now - timedelta(hours=1)),))
+
+
+def run_once():
+    """Claim and process up to BATCH_SIZE due leads. Returns how many were handled."""
+    handled = 0
+    with closing(db()) as conn:
+        while handled < BATCH_SIZE:
+            row = claim_one(conn)
+            if not row:
+                break
+            process_lead(row)
+            handled += 1
+    return handled
+
+
+def worker_loop(worker_id):
+    log.info("Worker thread started. (%s)", worker_id)
+    last_maint = 0.0
+    while True:
         try:
-            reset_stale_processing()
-            if time.time() - last_purge > 3600:
-                purge_old()
-                last_purge = time.time()
-
-            processed = 0
-            while processed < BATCH_SIZE and not STOP.is_set():
-                lead = claim_one()
-                if lead is None:
-                    break
-                process_lead(lead)
-                processed += 1
-            if processed:
-                wait = 1  # more may be waiting; short pause keeps ERPNext from being hammered
+            heartbeat(worker_id)
+            if time.time() - last_maint > MAINTENANCE_EVERY_SECONDS:
+                maintenance()
+                last_maint = time.time()
+            if run_once() == 0:
+                time.sleep(WORKER_IDLE_SECONDS)
         except Exception:
-            log.exception("Worker loop error (will keep running).")
-        STOP.wait(wait)
-    log.info("Worker thread stopped.")
+            log.exception("worker loop error")
+            time.sleep(WORKER_IDLE_SECONDS)
 
 
-_worker_threads = []
+_workers_started = False
 
 
-def start_worker():
-    if any(t.is_alive() for t in _worker_threads):
+def start_workers():
+    global _workers_started
+    if _workers_started:
         return
-    _worker_threads.clear()
-    for i in range(WORKER_THREADS):
-        t = threading.Thread(target=worker_loop, name=f"lead-worker-{i + 1}", daemon=True)
-        t.start()
-        _worker_threads.append(t)
+    _workers_started = True
+    try:
+        n = int(get_config().get("worker_threads", 1))
+    except Exception:
+        n = 1
+    n = max(1, min(8, n))
+    host = socket.gethostname()
+    for i in range(n):
+        wid = f"{host}-{os.getpid()}-{i}"
+        threading.Thread(target=worker_loop, args=(wid,), name=f"worker-{i}", daemon=True).start()
 
 
-# --------------------------------------------------------------------------------------
-# Webhook
-# --------------------------------------------------------------------------------------
-
-
-def valid_signature(raw_body: bytes, header: str) -> bool:
+# ---------------------------------------------------------------- webhook routes
+def valid_signature(raw, header, secret):
     if not header or not header.startswith("sha256="):
         return False
-    expected = hmac.new(APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header[len("sha256="):])
+    expected = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected.encode(), header[len("sha256="):].encode())
 
 
-@app.route("/webhook/facebook-leads", methods=["GET"])
+@app.get("/webhook/facebook-leads")
 def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        log.info("Webhook verified.")
-        return challenge, 200
+    cfg = get_config()
+    token = request.args.get("hub.verify_token", "")
+    if request.args.get("hub.mode") == "subscribe" and hmac.compare_digest(token.encode(), cfg["verify_token"].encode()):
+        return request.args.get("hub.challenge", ""), 200
     return "Forbidden", 403
 
 
-@app.route("/webhook/facebook-leads", methods=["POST"])
-def receive_lead():
+@app.post("/webhook/facebook-leads")
+def receive_webhook():
+    cfg = get_config()
     raw = request.get_data()
-    if not valid_signature(raw, request.headers.get("X-Hub-Signature-256", "")):
-        log.warning("Webhook rejected: invalid signature.")
+    if not valid_signature(raw, request.headers.get("X-Hub-Signature-256"), cfg["app_secret"]):
+        log.warning("webhook rejected: bad signature")
         return "Forbidden", 403
-
     try:
-        payload = json.loads(raw or b"{}")
+        body = json.loads(raw)
     except ValueError:
-        return jsonify({"error": "invalid JSON"}), 400
+        return "Bad JSON", 400
 
-    queued = duplicates = skipped = 0
     try:
-        for entry in payload.get("entry", []):
-            page_id = str(entry.get("id"))
-            if page_id not in PAGES:
-                log.warning("Lead from unrecognized Page ID %s -- skipping.", page_id)
-                skipped += 1
-                continue
-            for change in entry.get("changes", []):
-                value = change.get("value") or {}
-                leadgen_id = value.get("leadgen_id")
-                if not leadgen_id:
+        return _queue_leads(body, cfg)
+    except sqlite3.Error:
+        log.exception("webhook: database error")
+        return jsonify({"status": "error"}), 500
+
+
+def _queue_leads(body, cfg):
+    now = now_iso()
+    queued = duplicates = skipped = 0
+    with closing(db()) as conn:
+        for entry in body.get("entry", []) or []:
+            for change in entry.get("changes", []) or []:
+                if change.get("field") != "leadgen":
                     continue
-                if enqueue_lead(str(leadgen_id), page_id, value):
+                v = change.get("value") or {}
+                lid = v.get("leadgen_id")
+                if not lid:
+                    continue
+                page_id = str(v.get("page_id") or entry.get("id") or "")
+                if page_id not in cfg["pages"]:
+                    log.warning("Webhook: lead %s skipped, page %s is not configured", lid, page_id)
+                    skipped += 1
+                    continue
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO leads(leadgen_id,page_id,form_id,status,attempts,next_attempt_at,"
+                    "webhook_data,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (str(lid), page_id, str(v.get("form_id") or ""), "pending", 0, now,
+                     json.dumps(v), now, now))
+                if cur.rowcount:
                     queued += 1
                 else:
                     duplicates += 1
-    except sqlite3.Error:
-        # Storage problem: answer 5xx so Facebook resends the webhook later.
-        log.exception("Could not store lead(s) -- asking Facebook to retry.")
-        return jsonify({"error": "storage unavailable"}), 503
-
-    log.info("Webhook: %d queued, %d duplicate, %d skipped.", queued, duplicates, skipped)
-    return jsonify({"status": "received", "queued": queued, "duplicates": duplicates,
-                    "skipped": skipped}), 200
+    log.info("Webhook: %d queued, %d duplicate, %d skipped", queued, duplicates, skipped)
+    return jsonify({"status": "ok", "queued": queued, "duplicates": duplicates, "skipped": skipped}), 200
 
 
-# --------------------------------------------------------------------------------------
-# Admin API (for ERPNext)
-# --------------------------------------------------------------------------------------
+@app.get("/health")
+def health():
+    try:
+        with closing(db()) as conn:
+            conn.execute("SELECT 1").fetchone()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "error": redact(e)}), 503
 
 
+# ---------------------------------------------------------------- admin routes
 def admin_required(fn):
     @wraps(fn)
-    def wrapper(*args, **kwargs):
-        supplied = request.headers.get("X-Admin-Key", "")
-        if not hmac.compare_digest(supplied.encode(), ADMIN_API_KEY.encode()):
+    def wrapper(*a, **kw):
+        key = request.headers.get("X-Admin-Key", "")
+        if not hmac.compare_digest(key.encode(), get_config()["admin_api_key"].encode()):
             return jsonify({"error": "unauthorized"}), 401
-        return fn(*args, **kwargs)
+        return fn(*a, **kw)
     return wrapper
 
 
-def _int_arg(name, default, minimum, maximum):
-    raw = request.args.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        raise ValueError(f"{name} must be an integer")
-    return max(minimum, min(maximum, value))
-
-
-def _lead_summary(row) -> dict:
-    return {
-        "leadgen_id": row["leadgen_id"],
-        "page_id": row["page_id"],
-        "page_name": PAGES.get(row["page_id"], {}).get("name"),
-        "attempts": row["attempts"],
-        "last_error_stage": row["last_error_stage"],
-        "last_error_class": row["last_error_class"],
-        "last_error": row["last_error"],
-        "created_at": row["created_at"],
-        "died_at": row["died_at"],
-        "requeue_count": row["requeue_count"],
-    }
-
-
-@app.route("/admin/dead-leads", methods=["GET"])
-@admin_required
-def admin_dead_leads():
-    try:
-        limit = _int_arg("limit", 50, 1, 200)
-        offset = _int_arg("offset", 0, 0, 10_000_000)
-        since = parse_iso(request.args.get("since"))
-        until = parse_iso(request.args.get("until"))
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-
-    where, params = ["status='dead'"], []
-    if request.args.get("page_id"):
-        where.append("page_id=?")
-        params.append(request.args["page_id"])
-    if since:
-        where.append("died_at >= ?")
-        params.append(since)
-    if until:
-        where.append("died_at <= ?")
-        params.append(until)
-    clause = " AND ".join(where)
-
-    conn = db()
-    total = conn.execute(f"SELECT COUNT(*) FROM leads WHERE {clause}", params).fetchone()[0]
-    rows = conn.execute(
-        f"SELECT * FROM leads WHERE {clause} ORDER BY died_at DESC LIMIT ? OFFSET ?",
-        params + [limit, offset],
-    ).fetchall()
-
-    return jsonify({
-        "count": len(rows), "total": total, "limit": limit, "offset": offset,
-        "leads": [_lead_summary(r) for r in rows],
-    })
-
-
-@app.route("/admin/dead-leads/<leadgen_id>", methods=["GET"])
-@admin_required
-def admin_dead_lead_detail(leadgen_id):
-    conn = db()
-    row = conn.execute(
-        "SELECT * FROM leads WHERE leadgen_id=? AND status='dead'", (leadgen_id,)
-    ).fetchone()
-    if row is None:
-        return jsonify({"error": "not found (only dead leads are exposed)"}), 404
-
-    attempts = conn.execute(
-        "SELECT attempt_no, stage, classification, http_status, exception_class, response_body,"
-        " duration_ms, success, created_at FROM lead_attempts WHERE leadgen_id=?"
-        " ORDER BY id",
-        (leadgen_id,),
-    ).fetchall()
-
-    result = _lead_summary(row)
-    result["status"] = row["status"]
-    # Exactly what was (or would be) sent to ERPNext. Null if the Graph fetch never succeeded.
-    result["payload"] = json.loads(row["payload"]) if row["payload"] else None
-    result["attempts_history"] = [dict(a) for a in attempts]
-    return jsonify(result)
-
-
-@app.route("/admin/requeue", methods=["POST"])
-@admin_required
-def admin_requeue():
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
-        return jsonify({"error": "JSON body required"}), 400
-
-    where, params = ["status='dead'"], []
-    has_filter = body.get("all") is True
-
-    ids = body.get("leadgen_ids")
-    if ids is not None:
-        if not isinstance(ids, list) or not ids or len(ids) > 500 \
-                or not all(isinstance(i, str) for i in ids):
-            return jsonify({"error": "leadgen_ids must be a list of 1-500 strings"}), 400
-        where.append(f"leadgen_id IN ({','.join('?' * len(ids))})")
-        params.extend(ids)
-        has_filter = True
-
-    if body.get("page_id"):
-        where.append("page_id=?")
-        params.append(str(body["page_id"]))
-        has_filter = True
-
-    try:
-        since, until = parse_iso(body.get("since")), parse_iso(body.get("until"))
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    if since:
-        where.append("died_at >= ?")
-        params.append(since)
-        has_filter = True
-    if until:
-        where.append("died_at <= ?")
-        params.append(until)
-        has_filter = True
-
-    if not has_filter:
-        return jsonify({"error": "provide leadgen_ids, page_id, since/until, or all=true"}), 400
-
-    clause = " AND ".join(where)
-    conn = db()
-    skipped = conn.execute(
-        f"SELECT COUNT(*) FROM leads WHERE {clause} AND requeue_count >= ?",
-        params + [MAX_REQUEUES],
-    ).fetchone()[0]
-
-    # "refetch": true discards the stored payload so the lead is fetched from Facebook again
-    # (use after changing graph_lead_fields or fixing a token/permission problem).
-    refetch = ", payload=NULL" if body.get("refetch") is True else ""
-    now = now_iso()
-    cur = conn.execute(
-        "UPDATE leads SET status='pending', attempts=0, next_attempt_at=?, died_at=NULL,"
-        f" requeue_count=requeue_count+1, updated_at=?{refetch}"
-        f" WHERE {clause} AND requeue_count < ?",
-        [now, now] + params + [MAX_REQUEUES],
-    )
-    log.info("Requeued %d dead lead(s) (%d skipped: requeue cap).", cur.rowcount, skipped)
-    return jsonify({"requeued": cur.rowcount, "skipped_over_requeue_cap": skipped})
-
-
-@app.route("/admin/stats", methods=["GET"])
+@app.get("/admin/stats")
 @admin_required
 def admin_stats():
-    """Counts only (no lead data): early warning for expired tokens and stuck queues."""
-    conn = db()
-    counts = {s: 0 for s in ("pending", "processing", "done", "dead")}
-    for r in conn.execute("SELECT status, COUNT(*) AS n FROM leads GROUP BY status"):
-        counts[r["status"]] = r["n"]
-
-    oldest = conn.execute(
-        "SELECT MIN(created_at) FROM leads WHERE status IN ('pending','processing')"
-    ).fetchone()[0]
-    oldest_age = None
-    if oldest:
-        oldest_age = int((utcnow() - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds())
-
-    hour_ago = iso(utcnow() - timedelta(hours=1))
-    pages = {pid: {"name": cfg.get("name"), "last_success": None,
-                   "failures_last_hour": 0, "top_error_class": None}
-             for pid, cfg in PAGES.items()}
-
-    for r in conn.execute("SELECT page_id, MAX(completed_at) AS last FROM leads"
-                          " WHERE status='done' GROUP BY page_id"):
-        if r["page_id"] in pages:
-            pages[r["page_id"]]["last_success"] = r["last"]
-
-    class_counts = {}
-    for r in conn.execute(
-        "SELECT l.page_id AS page_id, a.classification AS cls, COUNT(*) AS n"
-        " FROM lead_attempts a JOIN leads l ON l.leadgen_id = a.leadgen_id"
-        " WHERE a.success=0 AND a.created_at >= ? GROUP BY l.page_id, a.classification",
-        (hour_ago,),
-    ):
-        if r["page_id"] in pages:
-            pages[r["page_id"]]["failures_last_hour"] += r["n"]
-            class_counts.setdefault(r["page_id"], {})[r["cls"]] = r["n"]
-    for pid, classes in class_counts.items():
-        pages[pid]["top_error_class"] = max(classes, key=classes.get)
-
-    return jsonify({
-        "counts": counts,
-        "oldest_unfinished_age_seconds": oldest_age,
-        "pages": pages,
-        "workers_alive": sum(t.is_alive() for t in _worker_threads),
-    })
+    now = now_dt()
+    with closing(db()) as conn:
+        counts = {s: 0 for s in ("pending", "processing", "done", "dead")}
+        for r in conn.execute("SELECT status, COUNT(*) c FROM leads GROUP BY status"):
+            counts[r["status"]] = r["c"]
+        oldest = conn.execute("SELECT MIN(created_at) m FROM leads WHERE status IN ('pending','processing')").fetchone()["m"]
+        age = int((now - parse_iso(oldest)).total_seconds()) if oldest else 0
+        pages = {}
+        for r in conn.execute("SELECT page_id, MAX(done_at) last_success FROM leads WHERE status='done' GROUP BY page_id"):
+            pages[r["page_id"]] = {"last_success": r["last_success"], "failures_last_hour": 0}
+        hour_ago = iso(now - timedelta(hours=1))
+        for r in conn.execute(
+                "SELECT l.page_id, COUNT(*) c FROM lead_attempts a JOIN leads l ON l.leadgen_id=a.leadgen_id "
+                "WHERE a.ok=0 AND a.created_at>=? GROUP BY l.page_id", (hour_ago,)):
+            pages.setdefault(r["page_id"], {"last_success": None, "failures_last_hour": 0})["failures_last_hour"] = r["c"]
+        alive = conn.execute("SELECT COUNT(*) c FROM workers WHERE last_seen>=?",
+                             (iso(now - timedelta(seconds=HEARTBEAT_ALIVE_SECONDS)),)).fetchone()["c"]
+    for pid in get_config()["pages"]:
+        pages.setdefault(str(pid), {"last_success": None, "failures_last_hour": 0})
+    return jsonify({"counts": counts, "oldest_unfinished_age_seconds": age,
+                    "pages": pages, "workers_alive": alive})
 
 
-@app.route("/health", methods=["GET"])
-def health():
+@app.post("/admin/test-alert")
+@admin_required
+def admin_test_alert():
+    ok, why = post_alert(get_config(), ":white_check_mark: Test alert from the Facebook leads webhook.")
+    return jsonify({"sent": ok, "error": why}), (200 if ok else 400)
+
+
+@app.get("/admin/dead-leads")
+@admin_required
+def admin_dead_leads():
+    where, args = ["status='dead'"], []
+    if request.args.get("page_id"):
+        where.append("page_id=?"); args.append(request.args["page_id"])
+    if request.args.get("since"):
+        where.append("dead_at>=?"); args.append(request.args["since"])
+    if request.args.get("until"):
+        where.append("dead_at<?"); args.append(request.args["until"])
     try:
-        db().execute("SELECT 1").fetchone()
-    except sqlite3.Error:
-        return jsonify({"status": "error"}), 503
-    return jsonify({"status": "ok"})
+        limit = max(1, min(500, int(request.args.get("limit", 50))))
+        offset = max(0, int(request.args.get("offset", 0)))
+    except ValueError:
+        return jsonify({"error": "limit/offset must be integers"}), 400
+    w = " AND ".join(where)
+    with closing(db()) as conn:
+        total = conn.execute(f"SELECT COUNT(*) c FROM leads WHERE {w}", args).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT leadgen_id,page_id,form_id,attempts,requeues,last_error,last_error_class,"
+            f"last_error_stage,created_at,dead_at FROM leads WHERE {w} ORDER BY dead_at DESC LIMIT ? OFFSET ?",
+            args + [limit, offset]).fetchall()
+    return jsonify({"total": total, "limit": limit, "offset": offset, "leads": [dict(r) for r in rows]})
 
 
-# --------------------------------------------------------------------------------------
-# Startup
-# --------------------------------------------------------------------------------------
+@app.get("/admin/dead-leads/<leadgen_id>")
+@admin_required
+def admin_dead_lead(leadgen_id):
+    with closing(db()) as conn:
+        row = conn.execute("SELECT * FROM leads WHERE leadgen_id=? AND status='dead'", (leadgen_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        attempts = conn.execute("SELECT * FROM lead_attempts WHERE leadgen_id=? ORDER BY id", (leadgen_id,)).fetchall()
+    lead = dict(row)
+    for k in ("payload", "graph_data", "webhook_data"):
+        lead[k] = json.loads(lead[k]) if lead[k] else None
+    return jsonify({"lead": lead, "attempts": [dict(a) for a in attempts]})
 
+
+@app.post("/admin/requeue")
+@admin_required
+def admin_requeue():
+    body = request.get_json(silent=True) or {}
+    where, args = ["status='dead'"], []
+    ids = body.get("leadgen_ids")
+    if ids:
+        if not isinstance(ids, list):
+            return jsonify({"error": "leadgen_ids must be a list"}), 400
+        where.append(f"leadgen_id IN ({','.join('?' * len(ids))})"); args += [str(i) for i in ids]
+    elif body.get("page_id") or body.get("since") or body.get("until"):
+        if body.get("page_id"):
+            where.append("page_id=?"); args.append(str(body["page_id"]))
+        if body.get("since"):
+            where.append("dead_at>=?"); args.append(body["since"])
+        if body.get("until"):
+            where.append("dead_at<?"); args.append(body["until"])
+    elif body.get("all") is not True:
+        return jsonify({"error": "give leadgen_ids, page_id/since/until, or all=true"}), 400
+
+    max_requeues = int(get_config().get("max_requeues", 5))
+    refetch = bool(body.get("refetch"))
+    requeued, skipped = [], []
+    now = now_iso()
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(f"SELECT id, leadgen_id, requeues FROM leads WHERE {' AND '.join(where)}", args).fetchall()
+            for r in rows:
+                if r["requeues"] >= max_requeues:
+                    skipped.append(r["leadgen_id"]); continue
+                conn.execute(
+                    "UPDATE leads SET status='pending', attempts=0, requeues=requeues+1, next_attempt_at=?, "
+                    "updated_at=?, dead_at=NULL, locked_at=NULL, payload=CASE WHEN ? THEN NULL ELSE payload END, "
+                    "graph_data=CASE WHEN ? THEN NULL ELSE graph_data END WHERE id=?",
+                    (now, now, 1 if refetch else 0, 1 if refetch else 0, r["id"]))
+                requeued.append(r["leadgen_id"])
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK"); raise
+    return jsonify({"requeued": len(requeued), "skipped_over_max_requeues": skipped, "leadgen_ids": requeued})
+
+
+# ---------------------------------------------------------------- startup
+try:
+    get_config()
+except RuntimeError as _e:
+    log.critical("Invalid configuration: %s", _e)
+    raise
 init_db()
+log.info("Database ready at %s", DATABASE_PATH)
 if os.environ.get("DISABLE_WORKER") != "1":
-    start_worker()
+    start_workers()
 
 if __name__ == "__main__":
-    # Development only. In production use gunicorn (see module docstring).
-    port = int(os.environ.get("PORT", 3000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT)

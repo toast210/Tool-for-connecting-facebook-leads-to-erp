@@ -1,0 +1,4 @@
+flask
+requests
+gunicorn        # Linux/macOS production server
+waitress        # Windows production server
