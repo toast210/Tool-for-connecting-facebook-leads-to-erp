@@ -1,8 +1,10 @@
-"""Facebook Lead Ads -> ERPNext webhook.
+"""Facebook Lead Ads (and website form) -> ERPNext webhook.
 
 Receives Meta leadgen webhooks, queues the lead ID in SQLite, and a background
 worker fetches the full lead from the Graph API and POSTs it to ERPNext, with
-retries. See README.md for setup.
+retries. Website form submissions arrive at /webhook/website-leads with their data
+and go through the same queue (no Graph fetch). When a lead gives up ("dead") an
+alert email is sent. See README.md for setup.
 """
 import hashlib
 import hmac
@@ -11,12 +13,16 @@ import logging
 import os
 import random
 import re
+import smtplib
 import socket
 import sqlite3
+import ssl
 import threading
 import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 from functools import wraps
 
 import requests
@@ -50,7 +56,7 @@ AD_FIELDS = ["created_time", "ad_id", "ad_name", "adset_id", "adset_name",
 DEFAULT_FIELD_MAPPING = {
     "Name": ["full_name", "name", "your_name", "customer_name"],
     "Phone": ["phone_number", "phone", "mobile", "mobile_number", "work_phone_number", "whatsapp_number"],
-    "Email": ["email", "email_address", "work_email"],
+    "Email": ["email", "email_address", "work_email"]
 }
 # Graph/webhook field -> output name. Order matters: the first three are sent right after the answers.
 DEFAULT_META_NAMES = {
@@ -60,6 +66,14 @@ DEFAULT_META_NAMES = {
     "page_id": "Page ID", "lead_source": "Lead Source",
 }
 PRIMARY_META = ("ad_name", "adset_name", "campaign_name")
+
+# Website form leads (POST /webhook/website-leads) are stored under this pseudo page id.
+WEBSITE_PAGE_ID = "website"
+WEBSITE_ID_KEYS = ("submission_id", "lead_id", "id")       # first one present = dedupe id
+WEBSITE_FORM_KEYS = ("form_name", "form_id", "form")       # first one present = "Form ID"
+WEBSITE_META = ("form_id", "created_time", "platform", "page_id", "lead_source")
+WEBSITE_MAX_FIELDS = 100
+WEBSITE_MAX_VALUE = 5000
 
 GRAPH_TOKEN_CODES = {10, 102, 190} | set(range(200, 300))
 GRAPH_TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 613} | set(range(80000, 80015))
@@ -114,6 +128,14 @@ def _load_config_file():
     if not isinstance(data.get("pages"), dict) or not data["pages"]:
         raise RuntimeError("credentials.json: 'pages' must contain at least one Page")
     validate_payload_cfg(data.get("payload") or {})
+    validate_alert_email_cfg(data.get("alert_email"))
+    validate_website_cfg(data.get("website"))
+    if WEBSITE_PAGE_ID in data["pages"]:
+        raise RuntimeError(f"credentials.json: '{WEBSITE_PAGE_ID}' is reserved for website leads; "
+                           "it cannot be a Facebook Page id")
+    if data.get("alert_webhook_url"):
+        log.warning("credentials.json: 'alert_webhook_url' is no longer used; alerts are sent by email "
+                    "(see 'alert_email' in README.md)")
     return data
 
 
@@ -141,15 +163,19 @@ def get_config():
         return _cfg_cache["data"]
 
 
+def valid_field_mapping(fm):
+    """{output name: form key or [form keys]}"""
+    return isinstance(fm, dict) and all(
+        isinstance(k, str) and (isinstance(v, str) or (isinstance(v, list) and all(isinstance(x, str) for x in v)))
+        for k, v in fm.items())
+
+
 def validate_payload_cfg(p):
     def bad(msg):
         raise RuntimeError(f"credentials.json payload: {msg}")
     if not isinstance(p, dict):
         bad("must be an object")
-    fm = p.get("field_mapping", {})
-    if not isinstance(fm, dict) or not all(
-            isinstance(k, str) and (isinstance(v, str) or (isinstance(v, list) and all(isinstance(x, str) for x in v)))
-            for k, v in fm.items()):
+    if not valid_field_mapping(p.get("field_mapping", {})):
         bad("field_mapping must map an output name to a form key or a list of form keys")
     for key in ("drop_fields", "required_fields", "phone_fields", "email_fields", "send_meta_fields"):
         if key in p and not (isinstance(p[key], list) and all(isinstance(x, str) for x in p[key])):
@@ -163,6 +189,79 @@ def validate_payload_cfg(p):
     unknown = [k for k in p.get("meta_field_names", {}) if k not in DEFAULT_META_NAMES]
     if unknown:
         bad(f"meta_field_names has unknown keys {unknown}; allowed: {list(DEFAULT_META_NAMES)}")
+
+
+SMTP_SECURITY = ("starttls", "ssl", "none")
+
+
+def validate_alert_email_cfg(a):
+    """'alert_email' is optional; when present it must be usable."""
+    if a is None:
+        return
+
+    def bad(msg):
+        raise RuntimeError(f"credentials.json alert_email: {msg}")
+    if not isinstance(a, dict):
+        bad("must be an object")
+    if not a.get("smtp_host"):
+        bad("'smtp_host' is required")
+    to = a.get("to")
+    if not to or not (isinstance(to, str) or (isinstance(to, list) and all(isinstance(x, str) and x for x in to))):
+        bad("'to' must be an email address or a list of addresses")
+    if not (a.get("from") or a.get("username")):
+        bad("'from' is required (or set 'username', which is then used as the sender)")
+    sec = a.get("security", "starttls")
+    if sec not in SMTP_SECURITY:
+        bad(f"'security' must be one of {list(SMTP_SECURITY)}")
+    if "smtp_port" in a:
+        try:
+            int(a["smtp_port"])
+        except (TypeError, ValueError):
+            bad("'smtp_port' must be a number")
+    if bool(a.get("username")) != bool(a.get("password")):
+        bad("set both 'username' and 'password', or neither")
+
+
+def website_keys(cfg):
+    w = cfg.get("website") or {}
+    keys = w.get("api_keys") or ([w["api_key"]] if w.get("api_key") else [])
+    return [k for k in keys if isinstance(k, str) and k]
+
+
+def validate_website_cfg(w):
+    """'website' is optional; when present the endpoint is enabled and needs at least one key."""
+    if w is None:
+        return
+
+    def bad(msg):
+        raise RuntimeError(f"credentials.json website: {msg}")
+    if not isinstance(w, dict):
+        bad("must be an object")
+    if "api_keys" in w and not (isinstance(w["api_keys"], list) and all(isinstance(k, str) for k in w["api_keys"])):
+        bad("'api_keys' must be a list of strings")
+    if "api_key" in w and not isinstance(w["api_key"], str):
+        bad("'api_key' must be a string")
+    keys = website_keys({"website": w})
+    if not keys:
+        bad("set 'api_key' (or 'api_keys' to rotate keys)")
+    if any(len(k) < 16 for k in keys):
+        bad("each API key must be at least 16 characters; generate one with "
+            "python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"")
+    for key in ("source", "name"):
+        if key in w and not isinstance(w[key], str):
+            bad(f"'{key}' must be a string")
+    if "field_mapping" in w and not valid_field_mapping(w["field_mapping"]):
+        bad("field_mapping must map an output name to a form field name or a list of names")
+
+
+def source_info(cfg, page_id):
+    """Display name and Lead Source for a lead's origin (a Facebook Page or the website)."""
+    page_id = str(page_id)
+    if page_id == WEBSITE_PAGE_ID:
+        w = cfg.get("website") or {}
+        return {"name": w.get("name", "Website"), "source": w.get("source", "Website"), "website": True}
+    p = cfg["pages"].get(page_id, {})
+    return {"name": p.get("name"), "source": p.get("source", "Facebook Lead Ads"), "website": False}
 
 
 def erp_lead_url(cfg):
@@ -199,6 +298,8 @@ def _known_secrets():
     erp = cfg.get("erpnext", {})
     vals += [erp.get("api_key"), erp.get("api_secret")]
     vals += list((erp.get("extra_headers") or {}).values())
+    vals.append((cfg.get("alert_email") or {}).get("password"))
+    vals += website_keys(cfg)
     return [v for v in vals if isinstance(v, str) and len(v) >= 6]
 
 
@@ -426,11 +527,17 @@ def clean_phone(v):
     return cleaned if re.search(r"\d", cleaned) else v
 
 
-def payload_settings(cfg):
+def payload_settings(cfg, website=False):
+    """Mapping and options for building a payload. Website leads also get website.field_mapping
+    (applied last, so it wins), which never affects Facebook leads."""
     p = cfg.get("payload") or {}
     mapping = {k: list(v) for k, v in DEFAULT_FIELD_MAPPING.items()}
-    for out_name, src in (p.get("field_mapping") or {}).items():
-        mapping[out_name] = [src] if isinstance(src, str) else list(src)
+    layers = [p.get("field_mapping") or {}]
+    if website:
+        layers.append((cfg.get("website") or {}).get("field_mapping") or {})
+    for layer in layers:
+        for out_name, src in layer.items():
+            mapping[out_name] = [src] if isinstance(src, str) else list(src)
     names = dict(DEFAULT_META_NAMES)
     names.update(p.get("meta_field_names") or {})
     return {
@@ -449,10 +556,12 @@ def payload_settings(cfg):
 
 def build_payload(row, graph, cfg):
     """Turn a Graph lead into the flat JSON sent to ERPNext (field matching happens here)."""
-    ps = payload_settings(cfg)
+    origin = source_info(cfg, row["page_id"])
+    ps = payload_settings(cfg, website=origin["website"])
     wh = json.loads(row["webhook_data"] or "{}")
-    page = cfg["pages"].get(str(row["page_id"]), {})
     id_field = cfg["erpnext"].get("leadgen_id_field", "leadgen_id")
+    if origin["website"]:        # no ads behind a website form: leave the ad/campaign fields out
+        ps["send_meta"] = [k for k in ps["send_meta"] if k in WEBSITE_META]
 
     answers = {}        # normalised key -> (original key, value)
     for f in graph.get("field_data") or []:
@@ -493,7 +602,7 @@ def build_payload(row, graph, cfg):
         if vals.get(k) is None:
             vals[k] = fb
     vals["page_id"] = str(row["page_id"])
-    vals["lead_source"] = page.get("source", "Facebook Lead Ads")
+    vals["lead_source"] = origin["source"]
     meta = {}
     for k in ps["send_meta"]:
         v = vals.get(k)
@@ -602,28 +711,113 @@ def backoff_seconds(failures):
     return base * random.uniform(0.9, 1.1)
 
 
-def post_alert(cfg, text):
-    """POST {"text": ...} to alert_webhook_url (Slack/Mattermost style). Returns (ok, error)."""
-    url = cfg.get("alert_webhook_url")
-    if not url:
-        return False, "alert_webhook_url is not configured"
+SMTP_TIMEOUT = 20      # seconds
+
+
+def send_email(cfg, subject, body):
+    """Send a plain-text email using credentials.json 'alert_email'. Returns (ok, error)."""
+    a = cfg.get("alert_email")
+    if not a:
+        return False, "alert_email is not configured in credentials.json"
+    security = a.get("security", "starttls")
+    port = int(a.get("smtp_port") or (465 if security == "ssl" else 587 if security == "starttls" else 25))
+    to = [a["to"]] if isinstance(a["to"], str) else list(a["to"])
+    sender = a.get("from") or a["username"]
+
+    msg = EmailMessage()
+    msg["Subject"] = f"{a.get('subject_prefix', '[FB Leads]')} {subject}".strip()
+    msg["From"] = sender
+    msg["To"] = ", ".join(to)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=sender.rpartition("@")[2] or None)
+    msg.set_content(body)
     try:
-        r = requests.post(url, json={"text": text}, timeout=5)
-        if r.status_code >= 300:
-            return False, f"alert webhook answered HTTP {r.status_code}"
+        ctx = ssl.create_default_context()
+        if security == "ssl":
+            server = smtplib.SMTP_SSL(a["smtp_host"], port, timeout=SMTP_TIMEOUT, context=ctx)
+        else:
+            server = smtplib.SMTP(a["smtp_host"], port, timeout=SMTP_TIMEOUT)
+        with server:
+            if security == "starttls":
+                server.starttls(context=ctx)
+            if a.get("username"):
+                server.login(a["username"], a["password"])
+            server.send_message(msg, from_addr=sender, to_addrs=to)
         return True, None
-    except requests.RequestException as e:
-        return False, redact(e, 300)
+    except (smtplib.SMTPException, OSError) as e:
+        return False, redact(f"{type(e).__name__}: {e}", 300)
 
 
-def send_alert(cfg, row, err):
-    if not cfg.get("alert_webhook_url"):
+def _lead_contact(lead_id):
+    """Name/phone/email from the stored payload, so the email can be acted on directly."""
+    try:
+        with closing(db()) as conn:
+            r = conn.execute("SELECT payload FROM leads WHERE id=?", (lead_id,)).fetchone()
+        p = json.loads(r["payload"]) if r and r["payload"] else {}
+    except (sqlite3.Error, ValueError):
+        p = {}
+    return {k: p.get(k) for k in ("Name", "Phone", "Email") if p.get(k)}
+
+
+def build_alert_email(cfg, row, err, attempts):
+    origin = source_info(cfg, row["page_id"])
+    if origin["website"]:
+        page_label = origin["name"]
+    else:
+        page_label = f"{origin['name']} ({row['page_id']})" if origin["name"] else str(row["page_id"])
+    contact = _lead_contact(row["id"])
+    subject = f"Lead {row['leadgen_id']} failed - {origin['name'] or row['page_id']} [{err.cls}/{err.stage}]"
+    lines = [
+        f"A {'website' if origin['website'] else 'Facebook'} lead could not be delivered to ERPNext "
+        "and the service has stopped retrying it.",
+        "",
+        f"Lead ID:     {row['leadgen_id']}",
+        f"{'Source:' if origin['website'] else 'Page:'}{' ' * (5 if origin['website'] else 7)}{page_label}",
+        f"Form ID:     {row['form_id'] or '-'}",
+        f"Received:    {row['created_at']} (UTC)",
+        f"Failed at:   {now_iso()} (UTC)",
+        f"Attempts:    {attempts}",
+        f"Stage:       {err.stage}   ({ {'fetch': 'getting the lead from Facebook', 'map': 'building the ERPNext payload', 'push': 'sending to ERPNext'}.get(err.stage, err.stage) })",
+        f"Error class: {err.cls}",
+        f"HTTP status: {err.http_status or '-'}",
+        "",
+        "Error:",
+        redact(err.message, 1500),
+    ]
+    if contact:
+        lines += ["", "Lead contact (so you can follow up by hand):"]
+        lines += [f"  {k}: {v}" for k, v in contact.items()]
+    lines += ["", "What to do:", {
+        "token": "  The page access token is expired or lacks permission. Put a new token for this page in "
+                 "credentials.json, then requeue the page's dead leads.",
+        "transient": "  Facebook or ERPNext was unreachable for the whole retry window (~31 min). Once it is "
+                     "back, requeue this lead.",
+        "permanent": "  ERPNext or Facebook rejected the lead. Fix the cause shown above (often a mandatory "
+                     "field or a mapping), then requeue this lead.",
+    }.get(err.cls, "  Fix the cause above, then requeue this lead.")]
+    lines += ["", "Requeue it with:",
+              f'  curl -X POST <service-url>/admin/requeue -H "X-Admin-Key: <admin key>" '
+              f'-H "Content-Type: application/json" -d \'{{"leadgen_ids": ["{row["leadgen_id"]}"]}}\'']
+    return subject, "\n".join(lines) + "\n"
+
+
+def send_alert(cfg, row, err, attempts):
+    """Email the 'lead is dead' alert in the background so the queue keeps moving."""
+    if not cfg.get("alert_email"):
         return
-    text = (f":rotating_light: Lead {row['leadgen_id']} (page {row['page_id']}) is DEAD at stage "
-            f"'{err.stage}' [{err.cls}]: {redact(err.message, 300)}")
-    ok, why = post_alert(cfg, text)
-    if not ok:
-        log.warning("alert failed: %s", why)
+    try:
+        subject, body = build_alert_email(cfg, row, err, attempts)
+    except Exception:
+        log.exception("could not build alert email for lead %s", row["leadgen_id"])
+        return
+
+    def _send():
+        ok, why = send_email(cfg, subject, body)
+        if ok:
+            log.info("alert email sent for lead %s", row["leadgen_id"])
+        else:
+            log.warning("alert email for lead %s failed: %s", row["leadgen_id"], why)
+    threading.Thread(target=_send, name="alert-email", daemon=True).start()
 
 
 def process_lead(row):
@@ -637,6 +831,8 @@ def process_lead(row):
                 graph = json.loads(row["graph_data"])
             elif row["payload"]:          # lead queued by an older version: resend as stored
                 graph = None
+            elif str(row["page_id"]) == WEBSITE_PAGE_ID:
+                raise LeadError("fetch", "permanent", "Website lead has no stored form data")
             else:
                 graph = fetch_lead(row, cfg)
                 conn.execute("UPDATE leads SET graph_data=? WHERE id=?", (json.dumps(graph), row["id"]))
@@ -663,7 +859,7 @@ def process_lead(row):
                 "graph_data=CASE WHEN ? THEN NULL ELSE graph_data END WHERE id=?",
                 (attempt_no, now, now, clear, clear, row["id"]))
         log.info("Lead %s done (created in ERPNext: %s, page=%s)", lid, erp_created_name(body),
-                 cfg["pages"].get(str(row["page_id"]), {}).get("name", row["page_id"]))
+                 source_info(cfg, row["page_id"])["name"] or row["page_id"])
     except LeadError as e:
         handle_failure(row, cfg, attempt_no, e)
     except Exception as e:  # unexpected: treat as transient, bounded by the retry limit
@@ -693,7 +889,7 @@ def handle_failure(row, cfg, attempt_no, err):
             log.warning("lead %s failed (%s/%s), retry in %ds: %s", row["leadgen_id"], err.stage,
                         err.cls, delay, redact(err.message, 300))
     if final:
-        send_alert(cfg, row, err)
+        send_alert(cfg, row, err, attempt_no)
 
 
 def heartbeat(worker_id):
@@ -797,6 +993,9 @@ def receive_webhook():
         body = json.loads(raw)
     except ValueError:
         return "Bad JSON", 400
+    if not isinstance(body, dict):
+        # 4xx, not 5xx, so Meta does not keep retrying a body that can never be processed.
+        return "Expected a JSON object", 400
 
     try:
         return _queue_leads(body, cfg)
@@ -809,11 +1008,17 @@ def _queue_leads(body, cfg):
     now = now_iso()
     queued = duplicates = skipped = 0
     with closing(db()) as conn:
-        for entry in body.get("entry", []) or []:
-            for change in entry.get("changes", []) or []:
-                if change.get("field") != "leadgen":
+        entries = body.get("entry")
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            changes = entry.get("changes")
+            for change in changes if isinstance(changes, list) else []:
+                if not isinstance(change, dict) or change.get("field") != "leadgen":
                     continue
-                v = change.get("value") or {}
+                v = change.get("value")
+                if not isinstance(v, dict):
+                    continue
                 lid = v.get("leadgen_id")
                 if not lid:
                     continue
@@ -833,6 +1038,102 @@ def _queue_leads(body, cfg):
                     duplicates += 1
     log.info("Webhook: %d queued, %d duplicate, %d skipped", queued, duplicates, skipped)
     return jsonify({"status": "ok", "queued": queued, "duplicates": duplicates, "skipped": skipped}), 200
+
+
+# ---------------------------------------------------------------- website form leads
+def _website_key_ok(cfg):
+    sent = request.headers.get("X-Website-Key", "")
+    auth = request.headers.get("Authorization", "")
+    if not sent and auth[:7].lower() == "bearer ":
+        sent = auth[7:].strip()
+    if not sent:
+        return False
+    return any(hmac.compare_digest(sent.encode(), k.encode()) for k in website_keys(cfg))
+
+
+def _website_value(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if isinstance(v, list):
+        return ", ".join(_website_value(x) for x in v if _website_value(x))
+    if isinstance(v, dict):
+        return json.dumps(v, ensure_ascii=False)
+    return str(v).strip()
+
+
+def _website_body():
+    """The submission as a flat dict: a JSON object, or a normal HTML form post."""
+    if request.is_json:
+        body = request.get_json(silent=True)
+        return body if isinstance(body, dict) else None
+    if request.form:
+        return {k: (v[0] if len(v) == 1 else v) for k, v in request.form.to_dict(flat=False).items()}
+    return None
+
+
+def _website_lead_id(body):
+    for k in WEBSITE_ID_KEYS:
+        v = _website_value(body.get(k))
+        if v:
+            if re.fullmatch(r"[A-Za-z0-9_.:\-]{1,100}", v):
+                return f"web-{v}"
+            return "web-" + hashlib.sha256(v.encode()).hexdigest()[:32]
+    return f"web-{os.urandom(16).hex()}"
+
+
+@app.post("/webhook/website-leads")
+def receive_website_lead():
+    """One website form submission -> the same queue as Facebook leads (already holding its data)."""
+    cfg = get_config()
+    if not website_keys(cfg):
+        return jsonify({"error": "website endpoint is not enabled (no 'website' section in credentials.json)"}), 404
+    if not _website_key_ok(cfg):
+        log.warning("website lead rejected: missing or wrong API key")
+        return jsonify({"error": "unauthorized"}), 401
+    body = _website_body()
+    if body is None:
+        return jsonify({"error": "send a JSON object (Content-Type: application/json) or a form post"}), 400
+
+    reserved = {norm_key(k) for k in WEBSITE_ID_KEYS + WEBSITE_FORM_KEYS}
+    form_id = next((_website_value(body.get(k)) for k in WEBSITE_FORM_KEYS if _website_value(body.get(k))), "")
+    field_data = []
+    for k, v in body.items():
+        key = str(k).strip()[:100]
+        if not key or norm_key(key) in reserved:
+            continue
+        val = _website_value(v)[:WEBSITE_MAX_VALUE]
+        if val:
+            field_data.append({"name": key, "values": [val]})
+    if len(field_data) > WEBSITE_MAX_FIELDS:
+        return jsonify({"error": f"too many fields (max {WEBSITE_MAX_FIELDS})"}), 400
+
+    # the lead must be reachable: a phone or an email under any name the mapping knows
+    mapping = payload_settings(cfg, website=True)["mapping"]
+    contact_keys = {norm_key(s) for out in ("Phone", "Email") for s in mapping.get(out, [])}
+    if not any(norm_key(f["name"]) in contact_keys for f in field_data):
+        return jsonify({"error": "a phone number or email is required",
+                        "accepted_phone_fields": mapping.get("Phone", []),
+                        "accepted_email_fields": mapping.get("Email", [])}), 400
+
+    lid = _website_lead_id(body)
+    now = now_iso()
+    graph = {"id": lid, "created_time": now, "form_id": form_id, "platform": "website", "field_data": field_data}
+    meta = {"source": "website", "form_id": form_id, "created_time": now,
+            "ip": request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()}
+    try:
+        with closing(db()) as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO leads(leadgen_id,page_id,form_id,status,attempts,next_attempt_at,"
+                "graph_data,webhook_data,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (lid, WEBSITE_PAGE_ID, form_id, "pending", 0, now, json.dumps(graph), json.dumps(meta), now, now))
+    except sqlite3.Error:
+        log.exception("website lead: database error")
+        return jsonify({"status": "error"}), 500
+    duplicate = cur.rowcount == 0
+    log.info("Website: lead %s %s", lid, "duplicate (already queued)" if duplicate else "queued")
+    return jsonify({"status": "ok", "lead_id": lid, "duplicate": duplicate}), 200
 
 
 @app.get("/health")
@@ -876,7 +1177,8 @@ def admin_stats():
             pages.setdefault(r["page_id"], {"last_success": None, "failures_last_hour": 0})["failures_last_hour"] = r["c"]
         alive = conn.execute("SELECT COUNT(*) c FROM workers WHERE last_seen>=?",
                              (iso(now - timedelta(seconds=HEARTBEAT_ALIVE_SECONDS)),)).fetchone()["c"]
-    for pid in get_config()["pages"]:
+    cfg = get_config()
+    for pid in list(cfg["pages"]) + ([WEBSITE_PAGE_ID] if website_keys(cfg) else []):
         pages.setdefault(str(pid), {"last_success": None, "failures_last_hour": 0})
     return jsonify({"counts": counts, "oldest_unfinished_age_seconds": age,
                     "pages": pages, "workers_alive": alive})
@@ -885,8 +1187,13 @@ def admin_stats():
 @app.post("/admin/test-alert")
 @admin_required
 def admin_test_alert():
-    ok, why = post_alert(get_config(), ":white_check_mark: Test alert from the Facebook leads webhook.")
-    return jsonify({"sent": ok, "error": why}), (200 if ok else 400)
+    cfg = get_config()
+    to = (cfg.get("alert_email") or {}).get("to")
+    ok, why = send_email(cfg, "Test alert", (
+        "This is a test email from the Facebook Lead Ads -> ERPNext webhook.\n\n"
+        "If you received it, alert emails are set up correctly: you will get one like this whenever a "
+        f"lead fails for good.\n\nSent at {now_iso()} (UTC) from host {socket.gethostname()}.\n"))
+    return jsonify({"sent": ok, "to": to, "error": why}), (200 if ok else 400)
 
 
 @app.get("/admin/dead-leads")
@@ -961,9 +1268,12 @@ def admin_requeue():
                     skipped.append(r["leadgen_id"]); continue
                 conn.execute(
                     "UPDATE leads SET status='pending', attempts=0, requeues=requeues+1, next_attempt_at=?, "
-                    "updated_at=?, dead_at=NULL, locked_at=NULL, payload=CASE WHEN ? THEN NULL ELSE payload END, "
-                    "graph_data=CASE WHEN ? THEN NULL ELSE graph_data END WHERE id=?",
-                    (now, now, 1 if refetch else 0, 1 if refetch else 0, r["id"]))
+                    "updated_at=?, dead_at=NULL, locked_at=NULL, "
+                    # a website lead's stored form data is its only copy: never discarded by refetch
+                    "payload=CASE WHEN ? AND page_id<>? THEN NULL ELSE payload END, "
+                    "graph_data=CASE WHEN ? AND page_id<>? THEN NULL ELSE graph_data END WHERE id=?",
+                    (now, now, 1 if refetch else 0, WEBSITE_PAGE_ID, 1 if refetch else 0, WEBSITE_PAGE_ID,
+                     r["id"]))
                 requeued.append(r["leadgen_id"])
             conn.execute("COMMIT")
         except Exception:

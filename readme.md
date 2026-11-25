@@ -1,629 +1,544 @@
 # Facebook Lead Ads → ERPNext Lead Pipeline
 
-A small, reliable service that receives Facebook Lead Ads webhooks, safely queues them, fetches the full lead from the Graph API, and pushes it into ERPNext. If anything fails, it retries automatically with exponential backoff, records every error, and exposes the leads that gave up ("dead" leads) to ERPNext so staff can see what went wrong and requeue them.
-
-This document describes the complete design and how to implement, deploy and operate it. It is written so that someone who has not seen the original discussion can build it from scratch.
+A small, reliable service (`webhook.py`) that receives Facebook Lead Ads webhooks for one or more Pages, queues each lead in SQLite, fetches the full lead from the Graph API, maps it into a flat JSON object and sends it to ERPNext. If anything fails it retries with exponential backoff, records every attempt, emails you when a lead gives up ("dead"), and exposes dead leads through an admin API so they can be inspected and requeued. Your website's forms can send leads into the same pipeline through `POST /webhook/website-leads` (section 17).
 
 ---
 
 ## Table of contents
 
-1. [Why this design](#1-why-this-design)
-2. [Architecture overview](#2-architecture-overview)
-3. [Lead lifecycle and states](#3-lead-lifecycle-and-states)
-4. [Retry policy](#4-retry-policy)
-5. [Error classification](#5-error-classification)
-6. [Database design (SQLite)](#6-database-design-sqlite)
-7. [The webhook](#7-the-webhook)
-8. [The worker thread](#8-the-worker-thread)
-9. [Duplicate protection (idempotency)](#9-duplicate-protection-idempotency)
-10. [Admin API (for ERPNext)](#10-admin-api-for-erpnext)
-11. [ERPNext side](#11-erpnext-side)
-12. [Configuration (`credentials.json`)](#12-configuration-credentialsjson)
-13. [Facebook setup](#13-facebook-setup)
-14. [Deployment](#14-deployment)
-15. [Security](#15-security)
-16. [Operations runbook](#16-operations-runbook)
-17. [Capacity and limits](#17-capacity-and-limits)
-18. [Testing checklist](#18-testing-checklist)
-19. [Implementation checklist](#19-implementation-checklist)
-20. [Future scaling](#20-future-scaling)
+1. [How it works](#1-how-it-works)
+2. [Quick start](#2-quick-start)
+3. [Configuration (`credentials.json`)](#3-configuration-credentialsjson)
+4. [Multiple Pages and forms](#4-multiple-pages-and-forms)
+5. [What is sent to ERPNext (field mapping)](#5-what-is-sent-to-erpnext-field-mapping)
+6. [ERPNext side](#6-erpnext-side)
+7. [Lead lifecycle, retries and error classes](#7-lead-lifecycle-retries-and-error-classes)
+8. [Email alerts](#8-email-alerts)
+9. [HTTP endpoints](#9-http-endpoints)
+10. [Database](#10-database)
+11. [Facebook setup](#11-facebook-setup)
+12. [Deployment](#12-deployment)
+13. [Security](#13-security)
+14. [Operations runbook](#14-operations-runbook)
+15. [Testing](#15-testing)
+16. [Limits and known gaps](#16-limits-and-known-gaps)
+17. [Website form leads](#17-website-form-leads)
 
 ---
 
-## 1. Why this design
-
-The simple version of this service does everything inside the webhook request: receive the notification, call the Graph API, call ERPNext, and return 200. It works, but it has three weaknesses:
-
-| Problem | What happens |
-|---|---|
-| **Lost leads** | If ERPNext is down or rejects the lead, the webhook still returns 200. Facebook never retries, so the lead exists only in a log line. |
-| **Duplicates** | If ERPNext is slow, the request can outlast Facebook's response window. Facebook resends the webhook and the same lead can be created twice. |
-| **No visibility** | Nobody can tell which leads failed or why without reading server logs. |
-
-The fix is the **inbox (queue) pattern**:
-
-1. The webhook only stores the lead's ID and returns 200 immediately.
-2. A background worker does the slow work (Graph fetch, ERPNext push) and retries on failure.
-3. The ID is the primary key, so repeated webhooks cannot create duplicate queue entries.
-4. Every failure is recorded, and leads that exhaust their retries are exposed to ERPNext.
-
-The webhook stores only the `leadgen_id`. The worker fetches the full lead from Facebook (which keeps it retrievable for about 90 days) and then stores the exact payload it sends to ERPNext on the lead row, so retries do not need Facebook again and you can always see what was sent.
-
----
-
-## 2. Architecture overview
+## 1. How it works
 
 ```
- Facebook Lead Ads
-        │  POST /webhook/facebook-leads   (leadgen_id, page_id)
-        ▼
- ┌──────────────────────────────────────────────────────┐
- │  Flask app (1 gunicorn process, a few threads)       │
- │                                                      │
- │  Webhook ──► verify signature ──► INSERT OR IGNORE   │
- │                                   into SQLite ──► 200│
- │                                                      │
- │  Worker thread (loop every few seconds)              │
- │    1. claim due lead (status=pending)                │
- │    2. fetch lead from Graph API                      │
- │    3. check ERPNext for existing leadgen_id          │
- │    4. POST lead to ERPNext                           │
- │    5. success → done │ failure → retry or dead       │
- │                                                      │
- │  Admin API (API key) ◄─────────── ERPNext            │
- │    GET  /admin/dead-leads                            │
- │    GET  /admin/dead-leads/<id>                       │
- │    POST /admin/requeue                               │
- └──────────────────────────────────────────────────────┘
-        │                         ▲
-        ▼                         │
-   SQLite (WAL mode)       ERPNext (Lead doctype, report, requeue button)
+ Facebook Lead Ads (any configured Page, any form)      Your website's server
+        │  POST /webhook/facebook-leads                  │  POST /webhook/website-leads
+        │  (leadgen_id, page_id, form_id, ...)           │  (the full submission)
+        ▼                                                ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │  Flask app (webhook.py) — ONE process                      │
+ │                                                            │
+ │  Facebook ─► verify X-Hub-Signature-256 ─► page configured?│
+ │              ─► INSERT OR IGNORE into SQLite ─► 200        │
+ │  Website  ─► check X-Website-Key ─► phone or email given?  │
+ │              ─► INSERT OR IGNORE (with its data) ─► 200    │
+ │                                                            │
+ │  Worker thread(s), every few seconds:                      │
+ │    1. claim a due lead (pending → processing)              │
+ │    2. fetch:  Graph API (page token + appsecret_proof);    │
+ │               skipped for website leads                    │
+ │    3. map:    build the flat payload (section 5)           │
+ │    4. push:   POST to erpnext.lead_url                     │
+ │    5. done │ retry later │ dead (+ alert email)            │
+ │                                                            │
+ │  Admin API (X-Admin-Key): stats, dead leads, requeue,      │
+ │                           test alert email                 │
+ └────────────────────────────────────────────────────────────┘
+        │                                   │
+        ▼                                   ▼
+   SQLite (WAL)                     ERPNext custom method / Lead API
 ```
 
-Components:
+Why a queue: the Facebook webhook only stores the lead ID and returns 200 in milliseconds. A website submission is stored with its form data, since there is no Graph API to fetch it from later. All slow or failure-prone work (Graph, ERPNext) happens in the background worker with retries, so a slow or down ERPNext never loses a lead and never makes Facebook resend the webhook. `leadgen_id` is unique in the database, so a webhook delivered twice is queued once.
 
-- **Webhook**: accepts Facebook notifications, verifies the signature, queues IDs. No external calls.
-- **Worker**: a single background thread that processes the queue with retries.
-- **SQLite database**: the queue, the state of each lead, and the history of every attempt.
-- **Admin API**: read-only view of dead leads for ERPNext, plus a requeue action.
-- **ERPNext**: receives the leads, holds a `leadgen_id` custom field for duplicate protection, and shows an on-demand report of dead leads with a requeue button.
-
-**Field mapping is done on the ERPNext side.** The service forwards the Facebook fields as they come (flattened to a simple key/value object) plus `lead_source` and `leadgen_id`. There is no `field_map` in the service configuration.
+The raw Graph response is stored after the first successful fetch. The ERPNext payload is **rebuilt from it on every attempt**, so a mapping fix in `credentials.json` takes effect on the next retry or requeue without contacting Facebook again.
 
 ---
 
-## 3. Lead lifecycle and states
+## 2. Quick start
 
-Each lead row has one of four statuses:
-
-| Status | Meaning |
-|---|---|
-| `pending` | Waiting for its `next_attempt_at` time. New leads start here, due immediately. |
-| `processing` | Claimed by the worker and currently being handled. |
-| `done` | Successfully created in ERPNext. |
-| `dead` | Gave up (retries exhausted or a permanent error). Visible to ERPNext. |
-
-Transitions:
-
-```
-          webhook
-             │
-             ▼
-         ┌─────────┐   claim    ┌────────────┐   success   ┌──────┐
-         │ pending │ ─────────► │ processing │ ──────────► │ done │
-         └─────────┘            └────────────┘             └──────┘
-            ▲   ▲                    │
-            │   │   transient error  │ permanent error, or
-            │   └────────────────────┤ retries exhausted
-            │     (schedule retry)   ▼
-            │                    ┌──────┐
-            └────────────────────│ dead │
-                  requeue        └──────┘
+```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate      Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Two special cases:
+1. Create `credentials.json` next to `webhook.py` (section 3). It is git-ignored; never commit it.
+2. Run the tests: `python smoke_test.py` (section 15).
+3. Run the service:
+   - Development: `python webhook.py` (listens on `0.0.0.0:3000`, or `PORT`).
+   - Production: see section 12 (`gunicorn` on Linux, `waitress` on Windows).
+4. Put it behind HTTPS and register `https://<your-domain>/webhook/facebook-leads` with Facebook (section 11).
+5. Send yourself a test alert: `curl -X POST https://<your-domain>/admin/test-alert -H "X-Admin-Key: <admin_api_key>"`.
 
-- **Stale `processing`**: if the process crashes mid-lead, the row stays `processing`. On startup and every few minutes, rows in `processing` for more than 5 minutes are reset to `pending`.
-- **Requeue**: moves a `dead` lead back to `pending`, due immediately, with the attempt counter reset. The attempt history is kept.
-
----
-
-## 4. Retry policy
-
-Retries use exponential backoff, doubling the wait each time, with up to **5 retries** (6 attempts in total including the first).
-
-| Event | Wait before next attempt | Time since first failure |
-|---|---|---|
-| Attempt 1 fails | 1 minute | 1 min |
-| Attempt 2 fails | 2 minutes | 3 min |
-| Attempt 3 fails | 4 minutes | 7 min |
-| Attempt 4 fails | 8 minutes | 15 min |
-| Attempt 5 fails | 16 minutes | 31 min |
-| Attempt 6 fails | none, lead becomes `dead` | ~31 min |
-
-The wait is always measured from the failure of the previous attempt. Implementation: after a failed attempt number `n` (1-based), if `n <= 5`, set `next_attempt_at = now + 2^(n-1) minutes` and status `pending`. If `n == 6`, set status `dead` and `died_at = now`.
-
-**Consequence to understand:** the whole retry window is about 31 minutes. If ERPNext is down for longer, leads that arrived during the outage will become `dead`. That is expected: dead does not mean lost. The lead is still retrievable from Facebook for about 90 days, and a requeue after the outage processes it normally. If you want automatic coverage of longer outages, extend the schedule (for example 1, 2, 4, 8, 16, 32, 60 minutes) by changing the backoff table, with no other code changes.
-
-Optional hardening: add a little random jitter (±10%) to each wait so many leads that failed together do not all retry at the same instant.
+The module creates the database and starts the worker thread(s) as soon as it is imported, and refuses to start if `credentials.json` is missing or invalid.
 
 ---
 
-## 5. Error classification
+## 3. Configuration (`credentials.json`)
 
-Not every error deserves five retries. Each failed attempt is classified, and the class drives what happens next and what ERPNext sees.
-
-| Class | Examples | Behaviour |
-|---|---|---|
-| **transient** | Timeouts, connection errors, ERPNext 5xx, Graph 5xx, rate limits (HTTP 429, Graph codes 4, 17, 32, 613) | Retry on the schedule. |
-| **token** | Graph OAuth errors (code 190 and similar, code 102 session errors) | Retried on the schedule, but flagged `token`. Affects every lead of that page, so the page token needs fixing. |
-| **permanent** | ERPNext 4xx validation errors (missing mandatory field, invalid value), Graph 4xx for a deleted or invalid lead | No retry. The lead goes `dead` immediately with the error saved. Retrying cannot fix it. |
-
-Notes:
-
-- HTTP 408 and 429 from ERPNext count as transient even though they are 4xx.
-- "A Lead with this `leadgen_id` already exists in ERPNext" is **not an error**. It means a previous attempt succeeded but its response was lost, so the lead is marked `done`.
-- Credentials are read at startup. After updating a page token in `credentials.json`, restart the service (or have the worker re-read the file on each attempt).
-
----
-
-## 6. Database design (SQLite)
-
-SQLite is enough for this workload. Use **WAL mode** and a **busy timeout** so the webhook writing and the worker reading do not block each other. Use one connection per thread, not a shared connection.
-
-```sql
-PRAGMA journal_mode = WAL;
-PRAGMA busy_timeout = 5000;
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS leads (
-    leadgen_id        TEXT PRIMARY KEY,         -- Facebook lead ID; also dedupes webhook resends
-    page_id           TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'pending'
-                      CHECK (status IN ('pending','processing','done','dead')),
-    attempts          INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at   TEXT NOT NULL,            -- ISO 8601 UTC
-    last_error        TEXT,                     -- short text of the latest error
-    last_error_stage  TEXT,                     -- 'fetch' (Graph) or 'push' (ERPNext)
-    last_error_class  TEXT,                     -- 'transient' | 'token' | 'permanent'
-    last_error_at     TEXT,
-    requeue_count     INTEGER NOT NULL DEFAULT 0,
-    created_at        TEXT NOT NULL,
-    updated_at        TEXT NOT NULL,
-    died_at           TEXT,
-    completed_at      TEXT,
-    payload           TEXT,                     -- JSON exactly as sent to ERPNext (see below)
-    webhook_value     TEXT                      -- JSON of the webhook's change.value (fallback data)
-);
-
-CREATE INDEX IF NOT EXISTS idx_leads_due
-    ON leads (status, next_attempt_at);
-
-CREATE TABLE IF NOT EXISTS lead_attempts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    leadgen_id      TEXT NOT NULL REFERENCES leads(leadgen_id) ON DELETE CASCADE,
-    attempt_no      INTEGER NOT NULL,
-    stage           TEXT NOT NULL,              -- 'fetch' or 'push'
-    classification  TEXT,                       -- transient | token | permanent (null on success)
-    http_status     INTEGER,                    -- null for timeouts / connection errors
-    exception_class TEXT,                       -- e.g. Timeout, ConnectionError, HTTPError
-    response_body   TEXT,                       -- truncated to ~2 KB
-    duration_ms     INTEGER,
-    success         INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_attempts_lead
-    ON lead_attempts (leadgen_id, attempt_no);
-```
-
-**Payload contents:** the payload carries every field Facebook gives us for the lead:
-
-| Source | Keys in the payload |
-|---|---|
-| Form answers (`field_data`) | One key per question, named exactly as in the form (`full_name`, `email`, `phone_number`, and every custom question). Multi-select answers are joined with `, `. |
-| Disclaimer checkboxes (`custom_disclaimer_responses`) | `disclaimer_<checkbox_key>` = the `is_checked` value (these are not part of `field_data`). |
-| Lead metadata | `created_time` (as Facebook returns it, ISO 8601), `ad_id`, `ad_name`, `adset_id`, `adset_name`, `campaign_id`, `campaign_name`, `form_id`, `is_organic`, `platform`, `partner_name` (when present). Any extra field you add to `graph_lead_fields` is copied too; nested values become JSON text. |
-| Added by the service | `leadgen_id` (or your `leadgen_id_field`), `lead_source`, `page_id` |
-
-Ad-level fields (`ad_*`, `adset_*`, `campaign_*`) require the `ads_management` permission on the token. If Facebook does not return `ad_id`, `form_id` or `created_time`, the service falls back to the values carried by the webhook notification itself (stored in `leads.webhook_value`); Graph values always win. `created_time` is not reformatted, so the ERPNext mapping must convert Facebook's `2026-10-05T08:00:00+0000` into ERPNext's `YYYY-MM-DD HH:MM:SS` for Datetime fields.
-
-**Payload storage:** after the first successful Graph fetch, the worker saves the exact JSON it sends to ERPNext (the flattened Facebook fields plus `lead_source` and `leadgen_id`) in `leads.payload`. Consequences:
-
-- Retries and requeues skip the Graph call and re-send the stored payload.
-- A lead whose ERPNext push keeps failing still has its data even if the Facebook token breaks later.
-- The payload is **personal data** (names, phones, emails). By default it is kept until the row is purged (30 days after `done`, 90 days after `dead`). Set `"clear_payload_on_done": true` to erase it as soon as the lead succeeds.
-- If the Graph fetch never succeeds, `payload` stays `NULL`.
-- Databases created before this column existed are migrated automatically on startup.
-
-Why two levels of error storage:
-
-- `leads.last_error*` gives a quick answer to "why is this lead stuck?".
-- `lead_attempts` keeps the **full history**. The first error is often the most informative one (for example a 400 validation error that later retries hide behind timeouts), and a single `last_error` column overwrites it.
-
-**What is stored per attempt:** stage (fetch or push), classification, HTTP status, exception class, response body (truncated), duration, timestamp. ERPNext's error body usually names the exact missing or invalid field, which is the most useful part.
-
-**Rules for stored errors:**
-
-- **Never store the Graph `access_token`.** The service passes it as a query parameter, and `requests` exceptions often include the full URL in their message. Strip `access_token=...` from any error text before saving or logging it.
-- **Truncate everything** to roughly 2 KB (a proxy's HTML error page can be much larger).
-- **Treat error text as personal data.** ERPNext validation errors can echo a lead's name, email or phone. Give the database file strict permissions (readable only by the service user).
-
-**Retention:** purge `done` leads (and their attempts) after about 30 days. Keep `dead` leads until resolved, but note that after about 90 days Facebook no longer returns the lead, so older dead leads cannot be requeued and can be purged.
-
----
-
-## 7. The webhook
-
-Two routes on the same path, as in the original service.
-
-**`GET /webhook/facebook-leads`** (verification handshake)
-Facebook calls this when you register the webhook. If `hub.mode == "subscribe"` and `hub.verify_token` equals your `verify_token`, return `hub.challenge` with status 200. Otherwise return 403.
-
-**`POST /webhook/facebook-leads`** (notifications)
-1. **Verify the signature.** Facebook signs every request with the `X-Hub-Signature-256` header: `sha256=` followed by the HMAC-SHA256 of the **raw request body** using your **app secret**. Compute it over the raw bytes (before JSON parsing) and compare in constant time. Reject with 403 if it does not match. Without this check anyone who finds the URL can inject fake leads.
-2. Parse the payload. For each `entry` (its `id` is the page ID) and each `change`, read `change.value.leadgen_id`.
-3. If the page ID is not in your configuration, log a warning and skip it.
-4. Insert the lead: `INSERT OR IGNORE INTO leads (...)` with status `pending`, `attempts = 0`, `next_attempt_at = now`, and the notification's `value` object saved in `webhook_value` (used only as a fallback for `ad_id`, `form_id` and `created_time`). The primary key makes repeated webhooks harmless.
-5. Return `200` immediately. **Do not call the Graph API or ERPNext here.**
-
-Payload shape (simplified):
+Full example:
 
 ```json
 {
-  "object": "page",
-  "entry": [
-    {
-      "id": "<PAGE_ID>",
-      "time": 1700000000,
-      "changes": [
-        {
-          "field": "leadgen",
-          "value": {
-            "leadgen_id": "<LEADGEN_ID>",
-            "page_id": "<PAGE_ID>",
-            "form_id": "<FORM_ID>",
-            "ad_id": "<AD_ID>",
-            "created_time": 1700000000
-          }
-        }
-      ]
-    }
-  ]
-}
-```
+  "verify_token": "long-random-string-for-the-facebook-handshake",
+  "app_secret": "facebook-app-secret",
+  "admin_api_key": "another-long-random-string-for-the-admin-api",
+  "graph_api_version": "v26.0",
 
-If the database insert itself fails (disk full, locked beyond the busy timeout), return a 5xx so Facebook retries the webhook. That is the one case where a non-200 is correct.
-
----
-
-## 8. The worker thread
-
-A single daemon thread started once when the app starts. It loops forever:
-
-```
-every ~5 seconds:
-    reset stale 'processing' rows (older than 5 min) to 'pending'
-    claim up to N due leads (status='pending' AND next_attempt_at <= now), oldest first
-    for each claimed lead:
-        process(lead)
-```
-
-**Claiming must be atomic.** Do the select and the update to `processing` in one transaction (`BEGIN IMMEDIATE`), or use a single `UPDATE ... WHERE leadgen_id IN (SELECT ...) RETURNING ...` (SQLite 3.35+). Even with one worker, claiming atomically means you can add a second worker thread later without two workers taking the same lead.
-
-**`process(lead)` steps:**
-
-1. Increment `attempts` and note the attempt number.
-2. **Get the payload.** If the lead already has a stored `payload` (from an earlier attempt), use it and skip the Graph call. Otherwise **fetch** the lead from the Graph API (`GET https://graph.facebook.com/{version}/{leadgen_id}` with the page's access token and the field list from `graph_lead_fields`), flatten it as described under *Payload contents* (all form answers, disclaimer answers and metadata), add `lead_source`, `page_id` and `leadgen_id`, and **save the result to `leads.payload`**.
-3. **Check ERPNext for an existing Lead** with this `leadgen_id` (see section 9). If found, mark `done` and stop.
-4. **Push** the stored payload to ERPNext: `POST {ERP_BASE_URL}/api/resource/Lead`.
-5. On success: set `status = 'done'`, `completed_at = now`, record a successful attempt row.
-6. On any failure: record the attempt (stage, class, status code, truncated body with the token stripped, duration), then apply the retry policy from section 4. A `permanent` classification skips straight to `dead`.
-
-**Batching:** limit how many leads are processed per loop (for example 20) so that after a long outage a requeue of hundreds of leads does not hit ERPNext all at once.
-
-**Shutdown:** the thread is a daemon. On stop, any lead mid-processing stays `processing` and is recovered by the stale-row reset on the next start.
-
----
-
-## 9. Duplicate protection (idempotency)
-
-A retry can create a duplicate in one situation: ERPNext created the Lead, but the response was lost (timeout or network drop), so the service thinks it failed and tries again. A requeue of a dead lead has the same risk.
-
-The fix needs two things:
-
-1. **A `leadgen_id` custom field on the ERPNext Lead doctype** (type Data, unique if you can). The service always sends `leadgen_id` with the payload.
-2. **A check before insert.** The worker asks ERPNext whether a Lead with this `leadgen_id` already exists:
-
-```
-GET {ERP_BASE_URL}/api/resource/Lead?filters=[["leadgen_id","=","<LEADGEN_ID>"]]&fields=["name"]&limit_page_length=1
-```
-
-If a record comes back, mark the lead `done` without creating another. If you mark the field unique in ERPNext, a concurrent duplicate insert will be rejected by the database as a last line of defense. The service should treat that specific duplicate-entry rejection as success.
-
-Because the database primary key already prevents duplicate queue entries, this ERPNext-side check is the only remaining source of duplicates, and it closes that gap.
-
----
-
-## 10. Admin API (for ERPNext)
-
-A separate route prefix, `/admin`, kept apart from the public Facebook webhook.
-
-**Authentication:** every request must send the header `X-Admin-Key: <key>`. Compare against `admin_api_key` from `credentials.json` using a constant-time comparison (`hmac.compare_digest`). Return 401 on mismatch. Use a different key from the Facebook verify token. Serve it over HTTPS only, and restrict by IP to your ERPNext server if it has a fixed address.
-
-### 10.1 List dead leads
-
-`GET /admin/dead-leads`
-
-Returns **only dead leads**. Leads that are still retrying are never returned.
-
-Query parameters (all optional):
-
-| Parameter | Meaning |
-|---|---|
-| `page_id` | Only leads from this Facebook page |
-| `since`, `until` | ISO 8601 range on `died_at` |
-| `limit` | Page size, default 50, max 200 |
-| `offset` | For paging |
-
-Response:
-
-```json
-{
-  "count": 2,
-  "total": 2,
-  "limit": 50,
-  "offset": 0,
-  "leads": [
-    {
-      "leadgen_id": "1234567890",
-      "page_id": "1000001",
-      "page_name": "Main Page",
-      "attempts": 6,
-      "last_error_stage": "push",
-      "last_error_class": "permanent",
-      "last_error": "417: Mandatory field missing: mobile_no",
-      "created_at": "2026-10-05T08:00:00Z",
-      "died_at": "2026-10-05T08:31:10Z",
-      "requeue_count": 0
-    }
-  ]
-}
-```
-
-The list does not include the lead's form answers. They are only returned by the detail call (10.2), so ERPNext staff can see exactly what failed and, if needed, create the lead by hand.
-
-### 10.2 Lead detail with attempt history
-
-`GET /admin/dead-leads/<leadgen_id>`
-
-Returns the same fields as above, the **`payload`** (exactly what was or would be sent to ERPNext, `null` if the Graph fetch never succeeded), and the full attempt list, so someone can see the story: for example attempt 1 timed out, attempt 2 got a 500, attempt 3 got a 417 validation error.
-
-```json
-{
-  "leadgen_id": "1234567890",
-  "status": "dead",
-  "payload": {
-    "full_name": "Jo Doe", "email": "jo@example.com", "phone_number": "+911234567890",
-    "created_time": "2026-10-05T08:00:00+0000",
-    "campaign_id": "C1", "campaign_name": "Diwali Offer", "adset_id": "S1", "adset_name": "Punjab 25-45",
-    "ad_id": "A1", "ad_name": "Video 1", "form_id": "F1", "is_organic": false, "platform": "fb",
-    "page_id": "1000001", "lead_source": "Facebook Lead Ads", "leadgen_id": "1234567890"
+  "erpnext": {
+    "lead_url": "ERP-url-for-adding-leads",
+    "api_key": "erpnext-api-key",
+    "api_secret": "erpnext-api-secret"
   },
-  "attempts_history": [
-    {"attempt_no": 1, "stage": "push", "classification": "transient",
-     "http_status": null, "exception_class": "Timeout", "duration_ms": 15001,
-     "created_at": "2026-10-05T08:00:05Z"},
-    {"attempt_no": 2, "stage": "push", "classification": "permanent",
-     "http_status": 417, "response_body": "{\"exception\":\"MandatoryError...\"}",
-     "duration_ms": 220, "created_at": "2026-10-05T08:01:07Z"}
-  ]
+
+  "pages": {
+    "111111111111111": { "name": "Main Page",   "page_access_token": "EAAB...", "source": "Facebook - Main Page" },
+    "222222222222222": { "name": "Second Page", "page_access_token": "EAAB...", "source": "Facebook - Second Page" },
+    "333333333333333": { "name": "Third Page",  "page_access_token": "EAAB...", "source": "Facebook - Third Page" }
+  },
+
+  "alert_email": {
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "security": "starttls",
+    "username": "you@company.com",
+    "password": "app-password",
+    "to": "you@company.com"
+  }
 }
 ```
 
-### 10.3 Requeue
+### Required keys
 
-`POST /admin/requeue`
+| Key | Meaning |
+|---|---|
+| `verify_token` | Any secret string. Facebook sends it back during the webhook handshake. |
+| `app_secret` | Facebook App secret (App settings → Basic). Used to verify `X-Hub-Signature-256` and to sign Graph calls (`appsecret_proof`). |
+| `admin_api_key` | Secret for the `/admin/*` endpoints (`X-Admin-Key` header). Use a different value from `verify_token`. |
+| `erpnext.lead_url` *or* `erpnext.base_url` | Where leads are POSTed. `lead_url` is used as-is (e.g. a custom `/api/method/...`). With only `base_url`, the URL is `base_url + /api/resource/Lead`. |
+| `pages` | Object keyed by **Facebook Page ID** (as a string). At least one Page. |
 
-Moves matching **dead** leads back to `pending`, due immediately, with `attempts = 0` and `requeue_count + 1`. The attempt history is kept. The worker does the actual push, so retry logic, error logging and duplicate checks stay in one place. This endpoint never calls ERPNext itself.
+### Per-Page keys (`pages.<page_id>`)
 
-Request body (JSON). At least one filter is required:
+| Key | Default | Meaning |
+|---|---|---|
+| `page_access_token` | — (required to fetch leads) | Long-lived Page access token with `leads_retrieval`. |
+| `name` | Page ID | Label used in logs and alert emails. |
+| `source` | `Facebook Lead Ads` | Sent to ERPNext as `Lead Source`. |
 
-```json
-{ "leadgen_ids": ["1234567890", "1234567891"] }
-```
-```json
-{ "page_id": "1000001", "since": "2026-10-05T00:00:00Z", "until": "2026-10-05T12:00:00Z" }
-```
-```json
-{ "all": true }
-```
+### Optional keys
 
-Add `"refetch": true` to any of these to discard the stored payload, so each lead is fetched from Facebook again. Use it after changing `graph_lead_fields`, or after granting a missing permission. Leads processed before such a change keep their old payload on retry unless you requeue them with `refetch`. Do not use it for leads close to the 90-day limit, since Facebook may no longer return them.
+| Key | Default | Meaning |
+|---|---|---|
+| `graph_api_version` | `v26.0` | Graph API version in the fetch URL. |
+| `graph_base_url` | `https://graph.facebook.com` | Only change for testing against a mock server. |
+| `graph_lead_fields` | see below | Fields requested from the Graph Lead object (list or comma-separated string). |
+| `erpnext.api_key` + `erpnext.api_secret` | none | Sends `Authorization: token key:secret`. Needed unless the ERPNext method allows guests. |
+| `erpnext.extra_headers` | none | Extra HTTP headers for every ERPNext request (object). |
+| `erpnext.leadgen_id_field` | `leadgen_id` | Payload key (and ERPNext field) that carries the Facebook lead ID. |
+| `erpnext.duplicate_check` | `false` | Before POSTing, GET the Lead list filtered by `leadgen_id_field`; if found, mark `done`. |
+| `erpnext.duplicate_check_url` | `lead_url` | URL for that lookup. **Set it to `https://<erp>/api/resource/Lead` when `lead_url` is a custom method.** |
+| `payload` | see section 5 | Field-mapping options. |
+| `alert_email` | none (no alerts) | SMTP settings for dead-lead emails (section 8). |
+| `website` | none (endpoint off) | Turns on `POST /webhook/website-leads`: `api_key` (or `api_keys`), optional `source`, `name` and a website-only `field_mapping` (section 17). |
+| `worker_threads` | `1` | Worker threads, 1 to 8. Read at startup only. |
+| `max_requeues` | `5` | A dead lead is not requeued again after this many requeues. |
+| `clear_payload_on_done` | `false` | Erase the stored Graph data and payload once a lead succeeds. |
 
-Safety rules:
+Default `graph_lead_fields`: `id, created_time, ad_id, ad_name, adset_id, adset_name, campaign_id, campaign_name, form_id, field_data, is_organic, platform, custom_disclaimer_responses`. If Facebook rejects a field for your API version, leads fail at the `fetch` stage as `permanent`. Remove the field and requeue with `"refetch": true`.
 
-- An empty body or a body with no filter is rejected with 400. Requeueing everything requires the explicit `"all": true`.
-- Only rows with status `dead` are affected. The response reports how many were requeued.
-- Consider capping `requeue_count` (for example refuse after 5) so a scheduled job cannot loop on a lead that keeps failing permanently.
+### Environment variables
 
-Response:
+| Variable | Default | Meaning |
+|---|---|---|
+| `CREDENTIALS_PATH` | `credentials.json` | Path to the config file. |
+| `DATABASE_PATH` | `leads.db` | SQLite file. |
+| `PORT` | `3000` | Port for `python webhook.py` only. |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
+| `DISABLE_WORKER` | unset | `1` = do not start worker threads (used by the tests). |
 
-```json
-{ "requeued": 2 }
-```
+### Live reload
 
-### 10.4 Health and stats (optional)
-
-- `GET /health` returns `{"status": "ok"}` if the database is reachable. No personal data, so it can be left unauthenticated for uptime monitors.
-- `GET /admin/stats` (authenticated, optional) returns **counts only**, never lead lists: number of leads per status, age of the oldest pending lead, time of the last successful lead, and per page the number of failures in the last hour. This gives an early warning for an expired token before leads go dead.
+The file is re-read automatically whenever its modification time changes, so new Pages, tokens, mapping or email settings apply without a restart (except `worker_threads`). If you save an invalid file while the service is running, the error is logged and **the previous valid settings stay in use**.
 
 ---
 
-## 11. ERPNext side
+## 4. Multiple Pages and forms
 
-### 11.1 Custom field
+- **Pages:** add one entry per Page under `pages`. Each lead uses the token of the Page it came from, and the Page's `source` becomes its `Lead Source`. All Pages must be subscribed to the **same** Facebook App (there is one `app_secret`).
+- **Forms:** every form on a configured Page is accepted; no per-form setup is needed. The `form_id` is sent as `Form ID`. Different forms can ask different questions: name/phone/email are matched by common question names, and every other answer is passed through (section 5).
+- **Unconfigured Pages:** a lead whose Page ID is not in `pages` is **logged and dropped** (the webhook still returns 200, so Facebook will not resend it). Add a Page to `credentials.json` *before* subscribing it to the app.
+- The `payload` mapping is shared by all Pages and forms; there are no per-form overrides.
+- `/admin/stats` and the dead-lead filters work per Page.
 
-On the **Lead** doctype add a custom field:
+---
 
-- Label `Leadgen ID`, fieldname `leadgen_id`, type Data, unique if possible, read-only is fine.
+## 5. What is sent to ERPNext (field mapping)
 
-### 11.2 Field mapping
+The worker POSTs one flat JSON object per lead. Example:
 
-The service forwards Facebook's field names unchanged. The mapping from Facebook keys (`full_name`, `email`, `phone_number`, `campaign_name`, ...) to Lead fields (`lead_name`, `email_id`, `mobile_no`, ...) happens on ERPNext. Make sure the mapping fills every mandatory Lead field (usually `lead_name`). If it does not, inserts fail with a permanent 4xx error and the lead goes dead.
+```json
+{
+  "Name": "Test Person",
+  "Phone": "+911234567891",
+  "Email": "test.person@example.com",
+  "Ad Name": "Test ad",
+  "Adset Name": "Test Adset",
+  "Campaign": "Test Campaign",
+  "City": "Ludhiana",
+  "Disclaimer Consent": "checked",
+  "Ad ID": "120200000000001",
+  "Adset ID": "120200000000002",
+  "Campaign ID": "120200000000003",
+  "Form ID": "555",
+  "Created Time": "2026-10-30T10:00:00+0000",
+  "Platform": "fb",
+  "Is Organic": false,
+  "Page ID": "123456789",
+  "Lead Source": "Facebook Lead Ads",
+  "leadgen_id": "1234567890123"
+}
+```
 
-If the mapping is implemented as a custom API method in an ERPNext app, change `ERP_BASE_URL/api/resource/Lead` in the worker to that method's URL (for example `/api/method/your_app.api.fb_lead`). `/api/resource/Lead` only accepts keys that already match Lead fieldnames and will not run custom mapping logic.
+How it is built, in order:
 
-### 11.3 On-demand dead-lead report
+1. **Mapped answers.** Each output field takes the first matching form question (matched case-insensitively, ignoring spaces and punctuation). Defaults:
 
-A Script Report or a custom page that calls the admin API when someone opens it. Put the service URL and admin key in a protected place (a Single doctype with a Password field, or `site_config.json`), not in client-side code. Because the API key must stay on the server, have the report call a whitelisted server method, not call the service from the browser.
+   | Output | Form question names tried |
+   |---|---|
+   | `Name` | `full_name`, `name`, `your_name`, `customer_name` (falls back to `first_name` + `last_name`) |
+   | `Phone` | `phone_number`, `phone`, `mobile`, `mobile_number`, `work_phone_number`, `whatsapp_number` |
+   | `Email` | `email`, `email_address`, `work_email` |
 
-Example server-side methods in a custom Frappe app:
+   A mapped field with no matching answer is sent as `""`. Multi-select answers are joined with `, `.
+2. **Normalisation** (on by default): phone fields lose spaces, dashes and Meta's `p:` prefix (`p:+91 98765-43210` → `+919876543210`); emails are trimmed and lower-cased; `Name` has extra spaces collapsed.
+3. `Ad Name`, `Adset Name`, `Campaign`.
+4. **Every other answer**, under a readable name (`city_name` → `City Name`). If that name collides with another key, ` (form)` is appended.
+5. **Disclaimer checkboxes** as `Disclaimer <Key>`.
+6. Remaining metadata: `Ad ID`, `Adset ID`, `Campaign ID`, `Form ID`, `Created Time`, `Platform`, `Is Organic`, `Page ID`, `Lead Source`. If Graph does not return `ad_id`, `adset_id`, `form_id` or `created_time`, the values from the webhook notification are used. `Created Time` is passed through as Facebook sends it (`2026-10-30T10:00:00+0000`).
+7. `static_fields`, then the lead ID under `erpnext.leadgen_id_field` (`leadgen_id`).
+
+### `payload` options
+
+```json
+"payload": {
+  "field_mapping": { "City": ["city", "city_name"], "Phone": "mobile_no" },
+  "required_fields": ["Name", "Phone"],
+  "drop_fields": ["internal_question"],
+  "send_meta_fields": ["ad_name", "adset_name", "campaign_name", "form_id", "page_id", "lead_source"],
+  "meta_field_names": { "campaign_name": "Campaign Name" },
+  "include_unmapped_answers": true,
+  "normalize_values": true,
+  "phone_fields": ["Phone"],
+  "email_fields": ["Email"]
+}
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `field_mapping` | defaults above | Output name → form question name or list of names. Adds to / replaces the defaults per output name. |
+| `required_fields` | `[]` | If any of these output fields is empty, the lead goes **dead at stage `map`** without calling ERPNext. |
+| `drop_fields` | `[]` | Form questions never sent as unmapped answers. |
+| `static_fields` | `{}` | Constant key/values added to every payload (override earlier keys). |
+| `send_meta_fields` | all | Which metadata to send. Allowed: `ad_name`, `adset_name`, `campaign_name`, `ad_id`, `adset_id`, `campaign_id`, `form_id`, `created_time`, `platform`, `is_organic`, `page_id`, `lead_source`. |
+| `meta_field_names` | names above | Rename metadata output keys (same allowed keys). |
+| `include_unmapped_answers` | `true` | Send answers that were not mapped. |
+| `normalize_values` | `true` | Phone/email/name clean-up (step 2). |
+| `phone_fields`, `email_fields` | `["Phone"]`, `["Email"]` | Which outputs get phone / email normalisation. |
+
+Invalid `payload` settings are rejected when the file is loaded, with a message naming the problem.
+
+---
+
+## 6. ERPNext side
+
+### 6.1 Receiving method
+
+With `lead_url` pointing at a custom method (as in this project), that method receives the JSON in section 5 and creates the Lead. Requirements:
+
+- **Authentication:** either `@frappe.whitelist(allow_guest=True)` or an API user whose `api_key`/`api_secret` are set in `credentials.json`. A 401/403 is classed `token` and retried, then the lead dies.
+- **Accept any keys.** Keys contain spaces (`Ad Name`) and vary by form, so read the body as a dict rather than naming parameters.
+- **Fail loudly.** If the Lead cannot be created, `frappe.throw(...)` (or return an HTTP 4xx/5xx). The service also detects errors returned inside a 200 response (`exc`, `exc_type`, `exception`, `error`, `status: "error"/"failed"`, `success: false`), but a method that swallows the error and returns normally makes the lead count as delivered.
+- **Be idempotent.** If a Lead with this `leadgen_id` already exists, return it instead of creating another (a retry after a lost response would otherwise duplicate it). Errors mentioning "duplicate" plus the `leadgen_id` field, `exc_type` `Duplicate...`, or HTTP 409 are treated as success.
+- **Return the new Lead's name** (`{"message": {"name": "CRM-LEAD-..."}}`); it is written to the service log.
+
+Sketch:
 
 ```python
 import frappe
-import requests
 
-def _cfg():
-    return {
-        "base": frappe.conf.get("lead_service_url"),
-        "key": frappe.conf.get("lead_service_admin_key"),
-    }
+@frappe.whitelist()
+def socialmediaform_webhook_listener(**kwargs):
+    data = frappe.request.get_json(silent=True) or dict(frappe.form_dict)
+    lid = data.get("leadgen_id")
+    existing = lid and frappe.db.get_value("Lead", {"leadgen_id": lid})
+    if existing:
+        return {"name": existing, "duplicate": True}
+    lead = frappe.get_doc({
+        "doctype": "Lead",
+        "lead_name": data.get("Name") or "Facebook Lead",
+        "mobile_no": data.get("Phone"),
+        "email_id": data.get("Email"),
+        "source": data.get("Lead Source"),
+        "leadgen_id": lid,
+        # map any other keys you need: data.get("Campaign"), data.get("City"), ...
+    })
+    lead.insert(ignore_permissions=True)
+    return {"name": lead.name}
+```
+
+If you POST straight to `/api/resource/Lead` instead (`base_url` only), the payload keys must be real Lead fieldnames, so set `payload.field_mapping`, `meta_field_names` and `static_fields` to produce `lead_name`, `mobile_no`, `email_id`, etc., and set `include_unmapped_answers` to `false`.
+
+### 6.2 Custom field
+
+Add a custom field on **Lead**: label `Leadgen ID`, fieldname `leadgen_id`, type Data, **Unique**. It is what makes retries and requeues safe, and it is required for `erpnext.duplicate_check`.
+
+### 6.3 Optional dead-lead report in ERPNext
+
+Dead leads are emailed (section 8) and available through the admin API (section 9). To show them inside ERPNext, call the admin API from whitelisted **server-side** methods (the admin key must never reach the browser):
+
+```python
+import frappe, requests
+
+def _svc():
+    return frappe.conf.get("lead_service_url"), frappe.conf.get("lead_service_admin_key")
 
 @frappe.whitelist()
 def get_dead_leads(page_id=None, limit=50, offset=0):
     frappe.only_for(["System Manager", "Sales Manager"])
-    c = _cfg()
-    params = {"limit": limit, "offset": offset}
-    if page_id:
-        params["page_id"] = page_id
-    r = requests.get(
-        f"{c['base']}/admin/dead-leads",
-        params=params,
-        headers={"X-Admin-Key": c["key"]},
-        timeout=15,
-    )
+    base, key = _svc()
+    params = {"limit": limit, "offset": offset, **({"page_id": page_id} if page_id else {})}
+    r = requests.get(f"{base}/admin/dead-leads", params=params, headers={"X-Admin-Key": key}, timeout=15)
     r.raise_for_status()
     return r.json()
 
 @frappe.whitelist()
 def requeue(leadgen_ids):
     frappe.only_for(["System Manager", "Sales Manager"])
-    c = _cfg()
-    r = requests.post(
-        f"{c['base']}/admin/requeue",
-        json={"leadgen_ids": frappe.parse_json(leadgen_ids)},
-        headers={"X-Admin-Key": c["key"]},
-        timeout=15,
-    )
+    base, key = _svc()
+    r = requests.post(f"{base}/admin/requeue", json={"leadgen_ids": frappe.parse_json(leadgen_ids)},
+                      headers={"X-Admin-Key": key}, timeout=15)
     r.raise_for_status()
     return r.json()
 ```
 
-The report shows one row per dead lead with page, error class, stage, last error, died time and a **Requeue** button that calls `requeue` with the selected IDs. Show the last error beside the button: if the cause was a permanent validation error, someone should fix the ERPNext mapping first, or the lead will simply die again.
-
-### 11.4 Reading the report
-
-| What you see | Likely cause | Action |
-|---|---|---|
-| Many leads from one page, class `token` | Page access token expired or revoked | Generate a new page token, update `credentials.json`, restart the service, requeue that page. |
-| Class `permanent`, stage `push`, message about a mandatory field | ERPNext mapping or form change | Fix the mapping or the form, then requeue. |
-| Class `transient`, stage `push`, many at the same time | ERPNext was down longer than the retry window | Confirm ERPNext is healthy, then requeue the time range. |
-| Class `permanent`, stage `fetch` | Lead deleted or inaccessible on Facebook | Cannot be recovered through the service. Handle manually. |
+Put `lead_service_url` and `lead_service_admin_key` in `site_config.json`.
 
 ---
 
-## 12. Configuration (`credentials.json`)
+## 7. Lead lifecycle, retries and error classes
 
-```json
-{
-  "verify_token": "a-long-random-string-for-the-webhook-handshake",
-  "app_secret": "facebook-app-secret-used-to-verify-signatures",
-  "graph_api_version": "v26.0",
-  "admin_api_key": "another-long-random-string-for-the-admin-api",
-  "erpnext": {
-    "base_url": "https://erp.example.com",
-    "api_key": "erpnext-api-key",
-    "api_secret": "erpnext-api-secret"
-  },
-  "pages": {
-    "1000001": {
-      "name": "Main Page",
-      "page_access_token": "EAAB...",
-      "source": "Facebook Lead Ads"
-    },
-    "1000002": {
-      "name": "Second Page",
-      "page_access_token": "EAAB...",
-      "source": "Facebook - Second Page"
-    }
-  }
-}
+### Statuses
+
+| Status | Meaning |
+|---|---|
+| `pending` | Waiting for `next_attempt_at`. New leads are due immediately. |
+| `processing` | Claimed by a worker. Rows stuck here for more than 5 minutes (crash, restart) are reset to `pending` automatically. |
+| `done` | Delivered to ERPNext (or ERPNext reported it already exists). |
+| `dead` | Gave up: a `permanent` error, or still failing after 5 retries. An alert email is sent. |
+
+```
+ webhook ─► pending ──claim──► processing ──success──► done
+              ▲  ▲                 │
+              │  └─ transient/token ┤ (wait, retry)
+              │                     ▼ permanent, or 6th failure
+              └──── requeue ───── dead ──► alert email
 ```
 
-Environment variables:
+### Retry schedule
 
-| Variable | Default | Meaning |
+Up to **5 retries** (6 attempts). Waits double each time, with ±10% random jitter:
+
+| Failure | Next attempt after | Time since first failure |
 |---|---|---|
-| `CREDENTIALS_PATH` | `credentials.json` | Path to the file above |
-| `DATABASE_PATH` | `leads.db` | SQLite file location |
-| `PORT` | `3000` | Port for the dev server (gunicorn uses its own `--bind`) |
-| `DISABLE_WORKER` | unset | Set to `1` to run without the worker thread (tests only) |
+| 1 | ~1 min | ~1 min |
+| 2 | ~2 min | ~3 min |
+| 3 | ~4 min | ~7 min |
+| 4 | ~8 min | ~15 min |
+| 5 | ~16 min | ~31 min |
+| 6 | — lead becomes `dead` | |
 
-Optional keys in `credentials.json`:
+If ERPNext or Facebook is down for longer than ~31 minutes, leads that arrived during the outage go dead. That is recoverable: Facebook keeps leads for about 90 days, and a requeue after the outage processes them normally.
+
+### Stages
+
+| Stage | What happens |
+|---|---|
+| `fetch` | Graph API call for the lead. |
+| `map` | Building the payload; `required_fields` check. |
+| `push` | Optional duplicate check, then the POST to ERPNext. |
+
+### Error classes
+
+| Class | Graph API | ERPNext | Behaviour |
+|---|---|---|---|
+| `transient` | Network errors, timeouts, HTTP 408/429/5xx, codes 1, 2, 4, 17, 32, 341, 613, 80000–80014, `is_transient` | Network errors, timeouts, HTTP 408/429/5xx, error text in a 200 body mentioning lock wait / deadlock / timeout / try again | Retried. |
+| `token` | OAuth codes 10, 102, 190, 200–299 | HTTP 401, 403 | Retried (fix the token or ERPNext credentials). |
+| `permanent` | Any other 4xx (e.g. lead deleted, unknown field) | Any other 4xx, or an error inside a 200 body | **Dead immediately.** |
+
+Unexpected Python errors are treated as `transient` (still bounded by the retry limit). A "duplicate" response from ERPNext is success, not an error.
+
+---
+
+## 8. Email alerts
+
+When a lead becomes **dead**, the service emails you. Nothing is sent for failures that will still be retried, so one dead lead = one email.
+
+Configure under `alert_email` in `credentials.json`:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `clear_payload_on_done` | `false` | Erase the stored payload when a lead succeeds |
-| `worker_threads` | `1` | Number of worker threads (1 to 8) |
-| `max_requeues` | `5` | Max times one lead can be requeued |
-| `graph_lead_fields` | see below | Fields requested from the Graph API Lead object (list or comma-separated string) |
-| `alert_webhook_url` | none | Receives `{"text": "..."}` when a lead dies |
-| `erpnext.leadgen_id_field` | `leadgen_id` | ERPNext custom field holding the Facebook lead ID |
-| `erpnext.duplicate_check` | `true` | Look up the lead in ERPNext before inserting |
+| `smtp_host` | — (required) | SMTP server. |
+| `smtp_port` | 587 (`starttls`), 465 (`ssl`), 25 (`none`) | SMTP port. |
+| `security` | `starttls` | `starttls`, `ssl` (implicit TLS) or `none`. Certificates are verified. |
+| `username`, `password` | none | SMTP login (set both or neither). |
+| `from` | `username` | Sender address. |
+| `to` | — (required) | One address or a list. |
+| `subject_prefix` | `[FB Leads]` | Prepended to every subject. |
 
-Default `graph_lead_fields`: `id, created_time, ad_id, ad_name, adset_id, adset_name, campaign_id, campaign_name, form_id, is_organic, platform, partner_name, custom_disclaimer_responses, field_data`. If Facebook rejects a field for your API version (error code 100, "nonexisting field"), the lead will fail with a permanent error and go dead. Remove the field from this list and requeue with `refetch`.
+Common providers:
 
-There is **no `field_map`** any more. `source` is sent as `lead_source`. Remove the line that sets it if ERPNext assigns the source itself.
+| Provider | `smtp_host` | Port / `security` | Password |
+|---|---|---|---|
+| Gmail / Google Workspace | `smtp.gmail.com` | 587 / `starttls` | A 16-character **App Password** (requires 2-Step Verification), not your normal password. |
+| Microsoft 365 / Outlook | `smtp.office365.com` | 587 / `starttls` | Account password; SMTP AUTH must be enabled for the mailbox. |
+| Zoho Mail | `smtp.zoho.in` (India) | 465 / `ssl` | Account or app-specific password. |
 
-Protect the file: `chmod 600 credentials.json`, owned by the service user, and keep it out of version control.
+Each email contains: lead ID, Page name and ID, form ID, received and failure times (UTC), attempts, stage, error class, HTTP status, the error text (secrets removed), the lead's **Name / Phone / Email** when they were fetched (so you can follow up by hand), what to do for that error class, and a ready-to-use requeue command. Example subject:
 
----
-
-## 13. Facebook setup
-
-1. Create a Facebook App (Business type) and add the **Webhooks** product.
-2. Under Webhooks, choose the **Page** object, set the callback URL to `https://your-domain/webhook/facebook-leads` and the verify token to your `verify_token`. Facebook calls the GET route to verify it.
-3. Subscribe to the **leadgen** field.
-4. Subscribe each Page to the app (Page subscription for `leadgen`).
-5. For each Page, obtain a **Page access token** with the permissions needed to read leads (`leads_retrieval`, `pages_manage_metadata`, `pages_show_list`, plus `pages_read_engagement` as required). Prefer a long-lived Page token generated from a long-lived user token or a system user. To receive the ad-level fields (`ad_*`, `adset_*`, `campaign_*`) the token must also come from a person who can advertise on the ad account and has the `ads_management` permission. Put it in `credentials.json`.
-6. Copy the **App secret** (App settings → Basic) into `app_secret`.
-7. Test with Facebook's **Lead Ads Testing Tool**, which sends a real webhook for a test lead.
-
-Permission and app-review requirements change over time, so confirm them against Meta's current documentation for the Graph API version in `graph_api_version`.
-
----
-
-## 14. Deployment
-
-### 14.1 Run with one gunicorn process
-
-Run **one worker process with several threads**:
-
-```bash
-gunicorn --workers 1 --threads 4 --bind 127.0.0.1:3000 app:app
+```
+[FB Leads] Lead 1234567890123 failed - Main Page [permanent/push]
 ```
 
-Why one process:
+**Test it:** `POST /admin/test-alert` sends a test email and returns `{"sent": true, "to": ...}`, or `400` with the SMTP error (e.g. `SMTPAuthenticationError ... not accepted` for a wrong password).
 
-- The webhook only inserts a row, which takes milliseconds, so one process absorbs far more webhooks than Facebook will ever send.
-- The worker handles about 1 to 2 seconds per lead (roughly 30 to 60 leads per minute), plenty for tens to hundreds of leads a day. Bursts just wait briefly in the queue.
-- SQLite prefers a single writer. Several processes would each start their own worker thread and contend for the file.
+Emails are sent in a background thread; if sending fails, a warning is logged and the lead stays dead and visible in `/admin/dead-leads`. The `alert_email.password` is redacted from logs and stored errors. The old `alert_webhook_url` (chat webhook) setting is no longer used; a warning is logged if it is still present.
 
-Do not use the Flask development server (`app.run`) in production.
+---
 
-### 14.2 systemd unit
+## 9. HTTP endpoints
+
+### Public
+
+| Method & path | Purpose |
+|---|---|
+| `GET /webhook/facebook-leads` | Facebook handshake. Returns `hub.challenge` if `hub.mode=subscribe` and `hub.verify_token` matches; otherwise 403. |
+| `POST /webhook/facebook-leads` | Lead notifications. 403 on a bad/missing signature, 400 on invalid JSON, 500 if the database write fails (Facebook then retries), otherwise `200 {"status":"ok","queued":n,"duplicates":n,"skipped":n}`. Only `leadgen` changes are processed. |
+| `POST /webhook/website-leads` | One website form submission (section 17). Needs `X-Website-Key` (or `Authorization: Bearer`). 404 if the `website` section is missing, 401 on a wrong key, 400 on a bad body or no phone/email, otherwise `200 {"status":"ok","lead_id":"web-…","duplicate":false}`. |
+| `GET /health` | `{"status":"ok"}` if the database is reachable, else 503. Does not check the worker (use `/admin/stats`). |
+
+Request bodies are limited to 1 MB.
+
+### Admin (header `X-Admin-Key: <admin_api_key>`, otherwise 401)
+
+**`GET /admin/stats`**
+
+```json
+{
+  "counts": {"pending": 0, "processing": 0, "done": 42, "dead": 1},
+  "oldest_unfinished_age_seconds": 0,
+  "pages": {"123456789": {"last_success": "2026-11-03T05:40:12Z", "failures_last_hour": 0}},
+  "workers_alive": 1
+}
+```
+
+`workers_alive` counts worker threads seen in the last 30 s; `0` means the worker is not running.
+
+**`POST /admin/test-alert`** — sends a test email (section 8).
+
+**`GET /admin/dead-leads`** — query parameters (all optional): `page_id`, `since`, `until` (compared with `dead_at`, format `2026-11-03T00:00:00Z`), `limit` (default 50, max 500), `offset`.
+
+```json
+{
+  "total": 1, "limit": 50, "offset": 0,
+  "leads": [{
+    "leadgen_id": "1234567890123", "page_id": "123456789", "form_id": "555",
+    "attempts": 1, "requeues": 0,
+    "last_error": "ERPNext rejected the lead (HTTP 200): ... Customer Name",
+    "last_error_class": "permanent", "last_error_stage": "push",
+    "created_at": "2026-11-03T05:40:00Z", "dead_at": "2026-11-03T05:40:03Z"
+  }]
+}
+```
+
+**`GET /admin/dead-leads/<leadgen_id>`** — `{"lead": {...}, "attempts": [...]}`. `lead` holds every column of the lead row, with `payload` (what was/would be sent), `graph_data` (raw Graph response) and `webhook_data` decoded as JSON. `attempts` is the full history (`attempt_no`, `stage`, `ok`, `error_class`, `http_status`, `response_body`, `error`, `created_at`). 404 if the lead is not dead.
+
+**`POST /admin/requeue`** — moves **dead** leads back to `pending`, due now, with `attempts = 0` and `requeues + 1`. History is kept. One filter is required:
+
+```json
+{ "leadgen_ids": ["1234567890123"] }
+{ "page_id": "123456789", "since": "2026-11-03T00:00:00Z", "until": "2026-11-03T12:00:00Z" }
+{ "all": true }
+```
+
+Add `"refetch": true` to discard the stored Graph data so the lead is fetched from Facebook again (after changing `graph_lead_fields` or fixing a permission). Without it, the stored Graph data is reused and the payload is rebuilt with the current mapping. Leads already requeued `max_requeues` times are skipped.
+
+```json
+{ "requeued": 1, "skipped_over_max_requeues": [], "leadgen_ids": ["1234567890123"] }
+```
+
+---
+
+## 10. Database
+
+SQLite in WAL mode (`busy_timeout` 30 s), one connection per operation. Created automatically at `DATABASE_PATH`.
+
+| Table | Contents |
+|---|---|
+| `leads` | One row per lead: `leadgen_id` (unique), `page_id`, `form_id`, `status`, `attempts`, `requeues`, `next_attempt_at`, `locked_at`, `last_error`, `last_error_class`, `last_error_stage`, `payload` (JSON sent to ERPNext), `graph_data` (raw Graph JSON; for website leads, the submitted form fields), `webhook_data` (the notification's `value`; for website leads, `form_id`, `created_time` and the sender's `ip`), `created_at`, `updated_at`, `done_at`, `dead_at`. |
+| `lead_attempts` | Every attempt: `leadgen_id`, `attempt_no`, `stage`, `ok`, `error_class`, `http_status`, `response_body` (≤ 2 KB, redacted), `error`, `created_at`. |
+| `workers` | Worker heartbeats for `/admin/stats`. |
+
+All timestamps are UTC, format `YYYY-MM-DDTHH:MM:SSZ`.
+
+Maintenance runs every 60 s: stale `processing` rows (> 5 min) go back to `pending`; `done` leads older than **30 days** and `dead` leads older than **90 days** are deleted with their attempts.
+
+The database holds personal data (names, phones, emails in `payload`/`graph_data`, website senders' IP addresses in `webhook_data`, and error bodies that may echo them). The IP is taken from the first `X-Forwarded-For` entry, which the caller can set, so treat it as a hint only. With the nginx config in section 12 that header is not set, so the IP is usually `127.0.0.1`. Add `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` to record real addresses. Restrict access to the file and its backups. `clear_payload_on_done` removes the data from successful leads immediately. Losing the database is recoverable for about 90 days, since leads can be refetched from Facebook.
+
+---
+
+## 11. Facebook setup
+
+1. Create a Facebook App (Business type) and add the **Webhooks** product.
+2. Under Webhooks choose the **Page** object, set the callback URL to `https://<your-domain>/webhook/facebook-leads` and the verify token to your `verify_token`. Facebook calls the GET route to verify it.
+3. Subscribe to the **leadgen** field.
+4. **Add each Page to `pages` in `credentials.json` first**, then subscribe it to the app (Page subscription for `leadgen`).
+5. For each Page, get a **long-lived Page access token** (from a long-lived user token or a system user) with `leads_retrieval`, `pages_manage_metadata`, `pages_show_list` and `pages_read_engagement` as required. For ad-level fields (`ad_*`, `adset_*`, `campaign_*`) the token's user also needs `ads_management` and advertiser access to the ad account.
+6. Copy the **App secret** into `app_secret`.
+7. Test with Facebook's **Lead Ads Testing Tool**, which sends a real webhook for a test lead.
+
+Permissions and app-review rules change; check Meta's documentation for your `graph_api_version`.
+
+---
+
+## 12. Deployment
+
+Run **exactly one process** with several threads. Each process starts its own worker thread(s), and SQLite prefers a single writer. Do not use `python webhook.py` in production.
+
+### Windows (waitress)
+
+```powershell
+.venv\Scripts\waitress-serve --host 127.0.0.1 --port 3000 --threads 4 webhook:app
+```
+
+Run it as a service (for example with NSSM or Task Scheduler "at startup") with the working directory set to the project folder, or set `CREDENTIALS_PATH` and `DATABASE_PATH`.
+
+### Linux (gunicorn + systemd)
+
+```bash
+gunicorn --workers 1 --threads 4 --bind 127.0.0.1:3000 webhook:app
+```
+
+Do not use `--preload` (worker threads do not survive the fork).
 
 ```ini
 [Unit]
@@ -635,7 +550,7 @@ User=leadsvc
 WorkingDirectory=/opt/fb-leads
 Environment=CREDENTIALS_PATH=/opt/fb-leads/credentials.json
 Environment=DATABASE_PATH=/var/lib/fb-leads/leads.db
-ExecStart=/opt/fb-leads/venv/bin/gunicorn --workers 1 --threads 4 --bind 127.0.0.1:3000 app:app
+ExecStart=/opt/fb-leads/.venv/bin/gunicorn --workers 1 --threads 4 --bind 127.0.0.1:3000 webhook:app
 Restart=always
 RestartSec=3
 
@@ -643,146 +558,271 @@ RestartSec=3
 WantedBy=multi-user.target
 ```
 
-On a restart nothing is lost: leads are in SQLite, and any row left in `processing` is reset to `pending`.
+### HTTPS (nginx)
 
-### 14.3 nginx with HTTPS
-
-Terminate TLS in nginx (for example with Let's Encrypt) and proxy to the app. Facebook requires HTTPS for webhooks, and the admin API carries personal data, so it must be HTTPS too.
+Facebook requires HTTPS, and the admin API returns personal data.
 
 ```nginx
 server {
     listen 443 ssl;
     server_name leads.example.com;
-
     # ssl_certificate / ssl_certificate_key ...
 
-    location /webhook/ {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_set_header Host $host;
-    }
-
+    location /webhook/ { proxy_pass http://127.0.0.1:3000; proxy_set_header Host $host; }
+    location /health   { proxy_pass http://127.0.0.1:3000; }
     location /admin/ {
-        allow 203.0.113.10;   # your ERPNext server
+        allow 203.0.113.10;   # your ERPNext server / office IP
         deny all;
         proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
     }
-
-    location /health {
-        proxy_pass http://127.0.0.1:3000;
-    }
 }
 ```
 
-### 14.4 Backups
-
-Back up the SQLite file only if you want to keep the history. It contains personal data (stored payloads), so protect backups like the live file. Leads can be refetched from Facebook for about 90 days, so losing the database is recoverable within that window.
+On restart nothing is lost: leads are in SQLite and any `processing` row is reset to `pending`.
 
 ---
 
-## 15. Security
+## 13. Security
 
 | Area | Measure |
 |---|---|
-| Webhook authenticity | Verify `X-Hub-Signature-256` with the app secret on every POST. |
-| Webhook handshake | Verify token compared on the GET route. |
-| Admin API | Separate `X-Admin-Key`, constant-time comparison, HTTPS only, IP allow-list for the ERPNext server, kept on its own `/admin` prefix. |
-| Requeue abuse | Requires a filter, `all` must be explicit, optional `requeue_count` cap. |
-| Secrets | `credentials.json` mode 600, never committed. Rotate tokens if exposed. |
-| Token leakage | Strip `access_token` from every logged or stored error text. |
-| Personal data | The database stores each lead's payload (names, phones, emails) and error bodies that may echo them. Restrict the database file (mode 600, service user only), exclude it from casual backups, consider `clear_payload_on_done`, and rely on the retention purge. |
-| ERPNext credentials | Use a dedicated ERPNext API user with permission only to read and create Leads. |
+| Webhook authenticity | `X-Hub-Signature-256` HMAC over the raw body with `app_secret`, constant-time compare. |
+| Handshake | `verify_token` compared in constant time. |
+| Graph calls | `appsecret_proof` sent with every request. |
+| Admin API | `X-Admin-Key`, constant-time compare. Serve over HTTPS and IP-restrict `/admin/`. |
+| Website endpoint | `X-Website-Key` compared in constant time against each configured key; send it from the website's **server** only, never from browser JavaScript. Keys rotate by listing old and new in `api_keys`. |
+| Requeue abuse | A filter is required, `all` must be explicit, `max_requeues` caps loops. |
+| Secrets | `credentials.json` is git-ignored; keep it readable only by the service user. |
+| Redaction | Page tokens, app secret, admin key, verify token, ERPNext key/secret/extra headers, website API keys and the SMTP password are stripped from logs, stored errors and alert emails, as are `access_token=`, `appsecret_proof=` and `token ...` patterns. |
+| Personal data | Stored in the database and included in alert emails (name/phone/email). Restrict the database file and the alert mailbox; use `clear_payload_on_done` and the retention purge. |
+| ERPNext account | Use a dedicated API user that can only create (and read) Leads. |
 
 ---
 
-## 16. Operations runbook
+## 14. Operations runbook
 
-**Normal day:** nothing to do. Leads arrive, get processed in seconds, and become `done`.
+**Normal day:** nothing to do. Check `GET /admin/stats` occasionally: `workers_alive` ≥ 1 and `dead` not growing.
 
-**ERPNext was down:**
-- Under about 31 minutes: leads recover automatically on the retry schedule.
-- Longer: some leads go dead. Once ERPNext is healthy, open the dead-lead report and requeue the affected time range.
+**You got an alert email.** The email states the class and stage:
 
-**Page token expired (class `token`):**
-1. Generate a new Page access token.
-2. Update `credentials.json` and restart the service.
-3. Requeue that page's dead leads (`page_id` filter).
+| Class / stage | Likely cause | Action |
+|---|---|---|
+| `token` / `fetch`, several leads from one Page | Page token expired or revoked | Put a new token in `credentials.json` (reloads automatically), then requeue that Page: `{"page_id": "..."}`. |
+| `token` / `push` | ERPNext API key/secret wrong or user disabled | Fix `erpnext.api_key`/`api_secret`, requeue. |
+| `permanent` / `push` | ERPNext rejected the data (mandatory field, validation) | Fix the ERPNext method or the `payload` mapping, then requeue (no `refetch` needed). |
+| `permanent` / `map` | A `required_fields` value was empty | Adjust `field_mapping` or `required_fields`, requeue. |
+| `permanent` / `fetch` | Lead deleted, form access removed, or an invalid `graph_lead_fields` entry | Fix the field list and requeue with `refetch`; deleted leads cannot be recovered — use the contact details in the email. |
+| `transient`, many at once | Facebook or ERPNext down > ~31 min | Once healthy, requeue the time range: `{"since": "...", "until": "..."}`. |
 
-**Validation error (class `permanent`, stage `push`):**
-1. Read the last error to see which field ERPNext rejected.
-2. Fix the ERPNext mapping or form.
-3. Requeue the leads.
+**No alert emails arriving:** call `POST /admin/test-alert` and read the returned error; check the service log for `alert email ... failed`.
 
-**Lead cannot be fetched (`permanent`, stage `fetch`):** the lead was deleted or the form access was removed. It cannot be recovered through the service.
+**Leads not arriving at all:** check the log for `bad signature` (wrong `app_secret`) or `page ... is not configured` (Page missing from `pages`), and that the Page is subscribed to the app.
 
-**Suspected duplicates:** search ERPNext Leads by `leadgen_id`. If the unique custom field and pre-check are in place, duplicates should not occur.
+**Website leads not arriving:** the website gets the reason in the response — `401` wrong key, `400` no phone/email (the response lists the accepted field names), `404` no `website` section. The service log shows `Website: lead web-… queued` for each accepted one.
 
-**Watching for trouble:** log every state change, alert when a lead dies (even a simple email or chat message), and check that the ERPNext report is opened regularly. A dead lead nobody looks at is as lost as before.
-
-**Housekeeping:** purge `done` rows older than 30 days (and their attempts), and dead rows older than about 90 days.
+**Suspected duplicates in ERPNext:** make `leadgen_id` unique on Lead and make the receiving method return the existing Lead (section 6.1), or enable `erpnext.duplicate_check` with `duplicate_check_url`.
 
 ---
 
-## 17. Capacity and limits
+## 15. Testing
+
+```bash
+python smoke_test.py      # core behaviour; exits 1 if any check fails
+pip install aiosmtpd
+python email_test.py      # alert emails against a local SMTP server; exits 1 on failure
+python website_test.py    # the website endpoint; exits 1 on failure
+```
+
+All three run entirely locally with mock Graph and ERPNext servers and a temporary database; they do not touch `credentials.json` or `leads.db`.
+
+`smoke_test.py` covers: handshake, signature rejection, queueing and duplicate webhooks, unknown Pages, payload mapping and normalisation, custom mapping options, errors hidden in 200 responses, duplicate responses, transient/token retries, death after the 6th failure, the admin API, requeue (with and without refetch), `required_fields`, config validation, and that tokens are not stored.
+
+`email_test.py` covers: the test-alert endpoint, one email per dead lead (and none for retries), email contents, secret redaction, wrong password, unreachable SMTP server, missing `alert_email`, config validation and multiple recipients.
+
+`website_test.py` covers: endpoint off without config, key checks (header, Bearer, rotation), JSON and HTML-form posts, mapping and pass-through fields, Lead Source and metadata, no Graph call, duplicate `submission_id`, validation (no phone/email, bad JSON, too many fields, > 1 MB), custom `field_mapping`, retries, dead leads and their alert text, requeue with `refetch`, stats, config validation and key redaction.
+
+Manual end-to-end checks after deployment:
+
+1. Handshake: `curl "https://<host>/webhook/facebook-leads?hub.mode=subscribe&hub.verify_token=<token>&hub.challenge=123"` returns `123`.
+2. `POST /admin/test-alert` → an email arrives.
+3. Lead Ads Testing Tool → the lead appears in ERPNext with `leadgen_id`, and `/admin/stats` shows it `done`.
+4. Temporarily break the ERPNext mapping → the next test lead goes dead and you get an email; fix it and requeue.
+
+---
+
+## 16. Limits and known gaps
 
 | Aspect | Value |
 |---|---|
-| Webhook receive rate | Thousands per minute (just a DB insert) |
-| Worker throughput | About 30 to 70 leads per minute per worker thread (each lead needs 3 sequential calls, roughly 0.8–2 s). Measured at about 68/min with simulated latencies totalling 0.85 s per lead; raise `worker_threads` for more. |
-| Daily volume this suits | Tens to a few hundred leads a day, with bursts |
-| Retry window | About 31 minutes (5 retries) |
-| Facebook lead retention | About 90 days |
-| Per-request timeouts | 15 seconds each for Graph and ERPNext |
+| Webhook rate | Thousands per minute (one DB insert each). |
+| Worker throughput | ~30–70 leads/min per worker thread (2–3 HTTP calls per lead); raise `worker_threads` (max 8). |
+| Retry window | ~31 minutes, then dead (requeue to recover). |
+| Facebook lead retention | ~90 days. |
+| HTTP timeouts | 15 s for Graph and ERPNext, 20 s for SMTP. |
+| Retention | `done` 30 days, `dead` 90 days. |
 
-Note on the timeouts: because the webhook never calls external services any more, a slow ERPNext cannot make Facebook resend the webhook.
+Not handled today:
 
----
-
-## 18. Testing checklist
-
-1. **Handshake:** `curl "https://host/webhook/facebook-leads?hub.mode=subscribe&hub.verify_token=<token>&hub.challenge=123"` returns `123`. A wrong token returns 403.
-2. **Signature:** a POST without a valid `X-Hub-Signature-256` returns 403. A correctly signed POST returns 200.
-3. **Queueing:** a signed webhook creates a `pending` row and returns 200 in milliseconds. Sending the same `leadgen_id` twice leaves one row.
-4. **Happy path:** with a real test lead (Lead Ads Testing Tool), the row ends as `done` and the Lead exists in ERPNext with `leadgen_id` set.
-5. **Transient failure:** stop ERPNext, send a lead, and watch the retry times (about 1, 3, 7, 15, 31 minutes after the first failure). Restart ERPNext partway and confirm it completes.
-6. **Dead path:** keep ERPNext down for the whole window and confirm the lead becomes `dead` with the attempt history recorded.
-7. **Permanent error:** make the ERPNext mapping reject the lead and confirm it goes dead after one attempt.
-8. **Token error:** use an invalid page token and confirm the class is `token` and no token appears in logs or stored errors.
-9. **Admin API:** without the key you get 401. `GET /admin/dead-leads` returns only dead leads. Detail shows attempt history.
-10. **Requeue:** an empty body is rejected with 400. A filtered requeue moves the lead to `pending`, and it completes after the cause is fixed.
-11. **Duplicates:** make the ERPNext response time out after creation and confirm the retry finds the existing Lead and marks it `done`.
-12. **Crash recovery:** kill the process while a lead is `processing`, restart, and confirm it is picked up again.
+- Leads from Pages not listed in `pages` are dropped, not stored.
+- One `payload` mapping for all Pages and forms; no per-form settings or form allow-list.
+- Alerts only on dead leads; an expired token is not reported until the first lead dies (~31 min).
+- `/health` does not report a stopped worker (`/admin/stats` → `workers_alive` does).
+- Retry count, backoff and retention periods are constants in `webhook.py`, not settings.
+- Any HTTP 409 or `Duplicate...` error from ERPNext counts as "already exists", even when a field other than `leadgen_id` caused it. Such a lead is marked `done` without being created, and no alert is sent. Keep `leadgen_id` the only unique field your receiving method can clash on.
+- Website lead ids are `web-<submission_id>`, without the form name. If two forms number their submissions separately, or the website's numbering restarts, a new lead with an id already in the database (done leads are kept 30 days) is answered `"duplicate": true` and not delivered. Send ids that are unique across all forms, such as UUIDs. A form field named `id`, `lead_id` or `submission_id` is used as the id, not sent as an answer.
+- `erpnext.duplicate_check` without `duplicate_check_url` sends its lookup to `lead_url`. If that is a method that creates Leads, every lookup creates an empty Lead.
+- Alert emails for website leads use the same `subject_prefix` (`[FB Leads]` by default).
 
 ---
 
-## 19. Implementation checklist
+## 17. Website form leads
 
-- [ ] Create SQLite schema (WAL mode, busy timeout, per-thread connections)
-- [ ] Webhook GET handshake
-- [ ] Webhook POST: signature check, `INSERT OR IGNORE`, return 200
-- [ ] Graph fetch function that flattens `field_data` and merges metadata
-- [ ] ERPNext existence check by `leadgen_id`
-- [ ] ERPNext push forwarding fields as-is plus `lead_source` and `leadgen_id`
-- [ ] Error classifier (transient, token, permanent) and token-stripping sanitizer
-- [ ] Attempt recording (`lead_attempts`) with truncated response bodies
-- [ ] Worker loop with atomic claim, batch limit, stale-`processing` reset
-- [ ] Backoff schedule (1, 2, 4, 8, 16 minutes) and dead transition
-- [ ] Admin API: dead-leads list, detail, requeue, with `X-Admin-Key`
-- [ ] Optional `/health` and `/admin/stats`
-- [ ] Retention purge job
-- [ ] ERPNext: `leadgen_id` custom field, mapping covers mandatory fields
-- [ ] ERPNext: whitelisted methods, on-demand dead-lead report, requeue button
-- [ ] gunicorn (1 worker, several threads), systemd unit, nginx with HTTPS and IP allow-list
-- [ ] Dead-lead alert (email or chat)
-- [ ] Run the testing checklist above
+Your website can send its form submissions to `POST /webhook/website-leads`. Each one joins the same queue as Facebook leads and goes to the same ERPNext method, with the same retries, dead-lead emails, admin API and requeue. There is no Graph call: the submission already carries the data.
 
----
+### Turn it on
 
-## 20. Future scaling
+Generate a key (`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`) and add to `credentials.json`:
 
-The design leaves room to grow without redesign:
+```json
+"website": {
+  "api_key": "<the key>",
+  "source": "Website",
+  "name": "Website"
+}
+```
 
-- **More throughput:** add worker threads in the same process (atomic claiming already prevents double processing).
-- **Longer outages:** extend the backoff table (for example up to 60-minute steps) or schedule a daily automatic requeue of recent dead leads.
-- **Much higher volume:** move the worker into its own process, or replace SQLite and the thread with Redis plus RQ or Celery. The webhook logic, error classification, retry schedule and admin API stay the same.
-- **Faster warning:** extend `/admin/stats` with per-page health (last success, recent failures, dominant error class) so an expired token is visible long before leads go dead.
+| Key | Default | Meaning |
+|---|---|---|
+| `api_key` | — (required) | Secret the website sends in `X-Website-Key`. At least 16 characters. |
+| `api_keys` | — | A list instead of `api_key`, to rotate: add the new key, update the website, then remove the old one. |
+| `source` | `Website` | Sent to ERPNext as `Lead Source`. |
+| `name` | `Website` | Label in logs and alert emails. |
+| `field_mapping` | none | Mapping for website leads only, applied on top of the defaults and `payload.field_mapping` (same format: ERPNext name → form field name or list of names). Facebook leads never see it. |
+
+Example for a contact form with the fields `name`, `mobile`, `email`, `city`, `role`, `projectType`, `interest` (name, mobile and email are already covered by the defaults):
+
+```json
+"website": {
+  "api_key": "<the key>",
+  "source": "Website",
+  "field_mapping": {
+    "City": ["city"],
+    "Profession": ["role"],
+    "Project Type": ["projectType"],
+    "Interested In": ["interest"]
+  }
+}
+```
+
+Every name in `field_mapping` is always sent for website leads (empty when the form left it blank), so ERPNext can rely on the key being there.
+
+The file reloads by itself, so no restart is needed. Without a `website` section the endpoint answers 404. nginx needs no change: `/webhook/` is already forwarded.
+
+### What the website sends
+
+The website's **server** POSTs one submission per request. Never send from browser JavaScript, where the key would be visible to anyone.
+
+```
+POST https://<your-domain>/webhook/website-leads
+X-Website-Key: <the key>
+Content-Type: application/json
+
+{
+  "submission_id": "8f3c2a71-0b4e-4c1d-9a55-2f6e1d7c9b10",
+  "form_name": "contact-us",
+  "name": "Asha Kaur",
+  "phone": "+91 98765 43210",
+  "email": "asha@example.com",
+  "city": "Ludhiana",
+  "message": "Need a quote for 20 units"
+}
+```
+
+- **Any field names work.** Name, phone and email are matched by the same names as Facebook forms (`name`/`full_name`/`first_name`+`last_name`, `phone`/`mobile`/`phone_number`/`whatsapp_number`, `email`/`email_address`, …) and by `payload.field_mapping` and `website.field_mapping`. Every other field is passed through under a readable name (`city` → `City`; camelCase is not split, so `projectType` → `ProjectType` unless you map it).
+- **A phone or an email is required**; without one the answer is 400 and lists the accepted field names.
+- **`submission_id`** (or `lead_id` / `id`): optional but recommended. A repeat with the same id is answered `"duplicate": true` and not sent to ERPNext twice, so the website can safely retry. Without one, every request becomes a new lead.
+- **`form_name`** (or `form_id` / `form`): optional, sent as `Form ID`, so you can tell forms apart in ERPNext.
+- A normal HTML form post (`application/x-www-form-urlencoded`) is accepted too. Lists are joined with `, `; `true`/`false` become `Yes`/`No`. Limits: 100 fields, 5,000 characters a value, 1 MB a request.
+
+| Answer | Meaning |
+|---|---|
+| `200 {"status":"ok","lead_id":"web-…","duplicate":false}` | Queued; ERPNext gets it within seconds. |
+| `400` | Not a JSON object or form post, no phone/email, or too many fields. Do not retry unchanged. |
+| `401` | Missing or wrong key. |
+| `404` | `website` section missing in `credentials.json`. |
+| `413` | Body over 1 MB. |
+| `500` | Database error: retry later with the same `submission_id`. |
+
+### What ERPNext receives
+
+The same flat JSON as Facebook leads (section 5), without the ad and campaign fields:
+
+```json
+{
+  "Name": "Asha Kaur",
+  "Phone": "+919876543210",
+  "Email": "asha@example.com",
+  "City": "Ludhiana",
+  "Message": "Need a quote for 20 units",
+  "Form ID": "contact-us",
+  "Created Time": "2026-11-23T05:22:33Z",
+  "Platform": "website",
+  "Page ID": "website",
+  "Lead Source": "Website",
+  "leadgen_id": "web-8f3c2a71-0b4e-4c1d-9a55-2f6e1d7c9b10"
+}
+```
+
+Website lead ids start with `web-`. In `/admin/stats`, dead-lead filters and requeue, website leads appear under the page id `website` (`{"page_id": "website"}` requeues them). A requeue with `refetch` keeps their data, since it is the only copy.
+
+### Sending code
+
+**PHP** (e.g. in the form's handler, after validating the input):
+
+```php
+<?php
+$payload = [
+    'submission_id' => bin2hex(random_bytes(16)),   // make it once per submission; reuse it if you retry
+    'form_name'     => 'contact-us',
+    'name'          => $_POST['name'] ?? '',
+    'phone'         => $_POST['phone'] ?? '',
+    'email'         => $_POST['email'] ?? '',
+    'message'       => $_POST['message'] ?? '',
+];
+$ch = curl_init('https://<your-domain>/webhook/website-leads');
+curl_setopt_array($ch, [
+    CURLOPT_POST           => true,
+    CURLOPT_HTTPHEADER     => ['Content-Type: application/json', 'X-Website-Key: ' . getenv('LEADS_WEBSITE_KEY')],
+    CURLOPT_POSTFIELDS     => json_encode($payload),
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_TIMEOUT        => 10,
+]);
+$response = curl_exec($ch);
+$status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+curl_close($ch);
+if ($status !== 200) {
+    error_log("lead not sent ($status): $response");   // keep the submission and retry later
+}
+```
+
+**Node.js** (18+, server side):
+
+```js
+const res = await fetch("https://<your-domain>/webhook/website-leads", {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "X-Website-Key": process.env.LEADS_WEBSITE_KEY },
+  body: JSON.stringify({ submission_id: crypto.randomUUID(), form_name: "contact-us", name, phone, email, message }),
+});
+if (!res.ok) console.error("lead not sent", res.status, await res.text());
+```
+
+**Test from a terminal:**
+
+```bash
+curl -s -X POST https://<your-domain>/webhook/website-leads \
+  -H "X-Website-Key: <the key>" -H "Content-Type: application/json" \
+  -d '{"submission_id":"test-1","name":"Test Person","phone":"+911234567891","email":"test@example.com"}'
+```
+
+Keep the key in the website's server settings or environment (`LEADS_WEBSITE_KEY` above), not in its code repository.
