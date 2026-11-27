@@ -1,6 +1,6 @@
 # Facebook Lead Ads → ERPNext Lead Pipeline
 
-A small, reliable service (`webhook.py`) that receives Facebook Lead Ads webhooks for one or more Pages, queues each lead in SQLite, fetches the full lead from the Graph API, maps it into a flat JSON object and sends it to ERPNext. If anything fails it retries with exponential backoff, records every attempt, emails you when a lead gives up ("dead"), and exposes dead leads through an admin API so they can be inspected and requeued. Your website's forms can send leads into the same pipeline through `POST /webhook/website-leads` (section 17).
+A small, reliable service (`webhook.py` and the `leadsvc` package) that receives Facebook Lead Ads webhooks for one or more Pages, queues each lead in SQLite, fetches the full lead from the Graph API, maps it into a flat JSON object and sends it to ERPNext. If anything fails it retries with exponential backoff, records every attempt, emails you when a lead gives up ("dead"), and exposes dead leads through an admin API so they can be inspected and requeued. Your website's forms can send leads into the same pipeline through `POST /webhook/website-leads` (section 17).
 
 ---
 
@@ -60,6 +60,28 @@ A small, reliable service (`webhook.py`) that receives Facebook Lead Ads webhook
 Why a queue: the Facebook webhook only stores the lead ID and returns 200 in milliseconds. A website submission is stored with its form data, since there is no Graph API to fetch it from later. All slow or failure-prone work (Graph, ERPNext) happens in the background worker with retries, so a slow or down ERPNext never loses a lead and never makes Facebook resend the webhook. `leadgen_id` is unique in the database, so a webhook delivered twice is queued once.
 
 The raw Graph response is stored after the first successful fetch. The ERPNext payload is **rebuilt from it on every attempt**, so a mapping fix in `credentials.json` takes effect on the next retry or requeue without contacting Facebook again.
+
+### Code layout
+
+```
+webhook.py              entry point: builds the Flask app, checks the config, prepares the
+                        database and starts the worker(s); servers run it as `webhook:app`
+leadsvc/
+  config.py             constants; loading, validating and live-reloading credentials.json
+  security.py           secret redaction, Facebook signature check, admin-key guard
+  db.py                 SQLite schema, connections, attempt history, timestamps
+  errors.py             LeadError, raised by every stage
+  graph.py              fetch stage: Graph API call and Graph error classes
+  mapping.py            map stage: building the payload (section 5)
+  erpnext.py            push stage: duplicate check, POST, ERPNext error classes
+  alerts.py             dead-lead emails (section 8)
+  worker.py             claim → fetch → map → push, retries, dead leads, maintenance
+  routes/facebook.py    GET/POST /webhook/facebook-leads
+  routes/website.py     POST /webhook/website-leads (section 17)
+  routes/admin.py       /health and /admin/* (section 9)
+```
+
+Dependencies only point down the list (`config` first, `routes` last), so there are no import cycles. `webhook.py` re-exports the functions the test scripts use, so `import webhook` keeps working.
 
 ---
 
@@ -522,7 +544,7 @@ Permissions and app-review rules change; check Meta's documentation for your `gr
 
 ## 12. Deployment
 
-Run **exactly one process** with several threads. Each process starts its own worker thread(s), and SQLite prefers a single writer. Do not use `python webhook.py` in production.
+Run **exactly one process** with several threads. Each process starts its own worker thread(s), and SQLite prefers a single writer. Do not use `python webhook.py` in production. Deploy `webhook.py` **and** the `leadsvc/` folder together, and start the server from the folder that contains them.
 
 ### Windows (waitress)
 
@@ -668,7 +690,7 @@ Not handled today:
 - One `payload` mapping for all Pages and forms; no per-form settings or form allow-list.
 - Alerts only on dead leads; an expired token is not reported until the first lead dies (~31 min).
 - `/health` does not report a stopped worker (`/admin/stats` → `workers_alive` does).
-- Retry count, backoff and retention periods are constants in `webhook.py`, not settings.
+- Retry count, backoff and retention periods are constants in `leadsvc/config.py`, not settings.
 - Any HTTP 409 or `Duplicate...` error from ERPNext counts as "already exists", even when a field other than `leadgen_id` caused it. Such a lead is marked `done` without being created, and no alert is sent. Keep `leadgen_id` the only unique field your receiving method can clash on.
 - Website lead ids are `web-<submission_id>`, without the form name. If two forms number their submissions separately, or the website's numbering restarts, a new lead with an id already in the database (done leads are kept 30 days) is answered `"duplicate": true` and not delivered. Send ids that are unique across all forms, such as UUIDs. A form field named `id`, `lead_id` or `submission_id` is used as the id, not sent as an answer.
 - `erpnext.duplicate_check` without `duplicate_check_url` sends its lookup to `lead_url`. If that is a method that creates Leads, every lookup creates an empty Lead.

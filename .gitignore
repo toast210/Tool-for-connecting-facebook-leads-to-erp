@@ -1,2 +1,33 @@
-# not tracking the credentials.json
+# Secrets: tokens, app secret, ERPNext key, SMTP password, website keys
 credentials.json
+credentials*.json
+*.env
+.env
+
+# Lead database: real names, phones and emails (plus SQLite WAL side files)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs can contain lead data and error bodies
+*.log
+
+# Python build and environment files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyCharm: personal settings, local paths and the spelling dictionary
+.idea/workspace.xml
+.idea/misc.xml
+.idea/dictionaries/
+.idea/shelf/
+.idea/httpRequests/
+.idea/dataSources/
+.idea/dataSources.local.xml
+
+# Claude Code local settings
+.claude/settings.local.json
